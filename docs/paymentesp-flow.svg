@@ -1,0 +1,147 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="1680" viewBox="0 0 1280 1680">
+  <defs>
+    <style>
+      .bg { fill: #f7f9fb; }
+      .title { font: 700 42px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 400 24px Arial, sans-serif; fill: #475569; }
+      .lane-title { font: 700 22px Arial, sans-serif; fill: #ffffff; }
+      .box-title { font: 700 24px Arial, sans-serif; fill: #0f172a; }
+      .box-text { font: 400 21px Arial, sans-serif; fill: #334155; }
+      .small { font: 400 18px Arial, sans-serif; fill: #475569; }
+      .decision-text { font: 700 22px Arial, sans-serif; fill: #0f172a; }
+      .yesno { font: 700 18px Arial, sans-serif; fill: #0f766e; }
+      .lane { fill: #e2e8f0; opacity: 0.55; }
+      .operator { fill: #0f766e; }
+      .esp { fill: #2563eb; }
+      .customer { fill: #7c3aed; }
+      .ppoints { fill: #ea580c; }
+      .box { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 16; }
+      .box-green { fill: #ecfdf5; stroke: #10b981; stroke-width: 2; rx: 16; }
+      .box-blue { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2; rx: 16; }
+      .box-orange { fill: #fff7ed; stroke: #f97316; stroke-width: 2; rx: 16; }
+      .box-purple { fill: #f5f3ff; stroke: #8b5cf6; stroke-width: 2; rx: 16; }
+      .decision { fill: #fefce8; stroke: #eab308; stroke-width: 2; }
+      .end { fill: #dcfce7; stroke: #16a34a; stroke-width: 2; rx: 28; }
+      .timeout { fill: #fee2e2; stroke: #ef4444; stroke-width: 2; rx: 28; }
+      .line { fill: none; stroke: #334155; stroke-width: 3; marker-end: url(#arrow); }
+      .line-soft { fill: none; stroke: #64748b; stroke-width: 2.5; stroke-dasharray: 8 8; marker-end: url(#arrowSoft); }
+      .note { fill: #ffffff; stroke: #94a3b8; stroke-width: 2; rx: 14; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowSoft" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1280" height="1680"/>
+
+  <text class="title" x="70" y="78">PaymentESP Flow: QR Payment + P-Points + Pulse</text>
+  <text class="subtitle" x="70" y="118">ESP32 สร้าง QR, ตรวจยอดจาก P-Points ทุก 5 วินาที, และสั่ง Pulse เมื่อพบยอดเงินเพิ่ม</text>
+
+  <rect class="lane" x="55" y="155" width="260" height="1410" rx="24"/>
+  <rect class="lane" x="355" y="155" width="260" height="1410" rx="24"/>
+  <rect class="lane" x="655" y="155" width="260" height="1410" rx="24"/>
+  <rect class="lane" x="955" y="155" width="270" height="1410" rx="24"/>
+
+  <rect class="operator" x="55" y="155" width="260" height="58" rx="20"/>
+  <rect class="esp" x="355" y="155" width="260" height="58" rx="20"/>
+  <rect class="customer" x="655" y="155" width="260" height="58" rx="20"/>
+  <rect class="ppoints" x="955" y="155" width="270" height="58" rx="20"/>
+
+  <text class="lane-title" x="126" y="193">เจ้าหน้าที่</text>
+  <text class="lane-title" x="452" y="193">ESP32</text>
+  <text class="lane-title" x="744" y="193">ลูกค้า</text>
+  <text class="lane-title" x="1042" y="193">P-Points</text>
+
+  <rect class="box box-green" x="85" y="260" width="200" height="120"/>
+  <text class="box-title" x="122" y="305">เปิดหน้าเว็บ</text>
+  <text class="box-text" x="104" y="340">http://paymentesp.local</text>
+
+  <rect class="box box-green" x="85" y="450" width="200" height="170"/>
+  <text class="box-title" x="113" y="492">กรอกข้อมูล</text>
+  <text class="box-text" x="108" y="530">stn_id / bank_id</text>
+  <text class="box-text" x="108" y="562">Amount</text>
+  <text class="box-text" x="108" y="594">QR Payload จริง</text>
+
+  <polygon class="decision" points="185,700 285,790 185,880 85,790"/>
+  <text class="decision-text" x="134" y="780">เลือกโหมด</text>
+  <text class="decision-text" x="128" y="812">QR</text>
+
+  <rect class="box box-green" x="85" y="960" width="200" height="120"/>
+  <text class="box-title" x="116" y="1005">กดสร้าง QR</text>
+  <text class="box-text" x="110" y="1040">Static หรือ Dynamic</text>
+
+  <rect class="box box-blue" x="385" y="260" width="200" height="130"/>
+  <text class="box-title" x="418" y="305">โหลด Config</text>
+  <text class="box-text" x="410" y="340">WiFi / Payload</text>
+  <text class="box-text" x="410" y="370">GPIO 26</text>
+
+  <rect class="box box-blue" x="385" y="700" width="200" height="140"/>
+  <text class="box-title" x="422" y="748">สร้าง QR</text>
+  <text class="box-text" x="410" y="783">Static: ไม่ระบุยอด</text>
+  <text class="box-text" x="410" y="815">Dynamic: ระบุยอด</text>
+
+  <rect class="box box-blue" x="385" y="960" width="200" height="145"/>
+  <text class="box-title" x="410" y="1008">แสดง QR</text>
+  <text class="box-text" x="410" y="1042">บนหน้าเว็บและ OLED</text>
+  <text class="box-text" x="410" y="1074">ค้างไว้ให้สแกน</text>
+
+  <rect class="box box-orange" x="985" y="960" width="210" height="145"/>
+  <text class="box-title" x="1016" y="1008">อ่านยอดตั้งต้น</text>
+  <text class="box-text" x="1010" y="1042">บันทึกเป็น Baseline</text>
+  <text class="box-text" x="1010" y="1074">ก่อนลูกค้าจ่าย</text>
+
+  <rect class="box box-purple" x="685" y="960" width="200" height="145"/>
+  <text class="box-title" x="730" y="1008">สแกน QR</text>
+  <text class="box-text" x="708" y="1042">จ่ายผ่านแอปธนาคาร</text>
+  <text class="box-text" x="708" y="1074">เงินเข้าบัญชีจริง</text>
+
+  <rect class="box box-blue" x="385" y="1190" width="200" height="150"/>
+  <text class="box-title" x="412" y="1238">Auto Check</text>
+  <text class="box-text" x="410" y="1272">ทุก 5 วินาที</text>
+  <text class="box-text" x="410" y="1304">สูงสุด 5 นาที</text>
+
+  <rect class="box box-orange" x="985" y="1190" width="210" height="150"/>
+  <text class="box-title" x="1020" y="1238">อ่านยอดใหม่</text>
+  <text class="box-text" x="1010" y="1272">ส่งยอดรวมล่าสุด</text>
+  <text class="box-text" x="1010" y="1304">กลับให้ ESP32</text>
+
+  <polygon class="decision" points="485,1410 600,1500 485,1590 370,1500"/>
+  <text class="decision-text" x="428" y="1490">ยอดเพิ่ม</text>
+  <text class="decision-text" x="435" y="1522">หรือไม่?</text>
+
+  <rect class="end" x="685" y="1438" width="200" height="125"/>
+  <text class="box-title" x="725" y="1485">ชำระสำเร็จ</text>
+  <text class="box-text" x="710" y="1520">OLED แสดง PAID</text>
+  <text class="box-text" x="710" y="1552">Pulse GPIO 26</text>
+
+  <rect class="timeout" x="85" y="1438" width="200" height="125"/>
+  <text class="box-title" x="121" y="1485">หมดเวลา</text>
+  <text class="box-text" x="108" y="1520">ครบ 5 นาที</text>
+  <text class="box-text" x="108" y="1552">สร้าง QR ใหม่</text>
+
+  <rect class="note" x="70" y="1608" width="1140" height="48"/>
+  <text class="small" x="90" y="1638">หมายเหตุ: QR PromptPay ที่สร้างเองไม่ได้หมดอายุจริงในระบบธนาคาร แต่ ESP32 จำกัด Session ฝั่งตู้ไว้ 5 นาทีเพื่อป้องกันยอดผิดรอบ</text>
+
+  <path class="line" d="M185 380 L185 450"/>
+  <path class="line" d="M185 620 L185 700"/>
+  <path class="line" d="M285 790 C330 790 340 770 385 770"/>
+  <text class="yesno" x="305" y="765">Static</text>
+  <path class="line" d="M185 880 L185 960"/>
+  <text class="yesno" x="196" y="925">Dynamic</text>
+  <path class="line" d="M285 1020 C330 1020 340 1032 385 1032"/>
+  <path class="line" d="M585 1032 C710 1032 840 1032 985 1032"/>
+  <path class="line-soft" d="M585 1032 C635 1032 640 1032 685 1032"/>
+  <path class="line" d="M1090 1105 L1090 1190"/>
+  <path class="line" d="M985 1265 C840 1265 735 1265 585 1265"/>
+  <path class="line" d="M485 1105 L485 1190"/>
+  <path class="line" d="M485 1340 L485 1410"/>
+  <path class="line" d="M600 1500 C635 1500 650 1500 685 1500"/>
+  <text class="yesno" x="625" y="1478">ใช่</text>
+  <path class="line" d="M370 1500 C330 1500 315 1500 285 1500"/>
+  <text class="yesno" x="310" y="1478">ครบ 5 นาที</text>
+  <path class="line-soft" d="M485 1410 C700 1325 730 1265 985 1265"/>
+  <text class="yesno" x="640" y="1340">ยังไม่พบยอดเพิ่ม วนเช็กต่อ</text>
+</svg>

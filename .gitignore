@@ -1,0 +1,16 @@
+.pio/
+.venv/
+.vscode/
+*.bin
+*.elf
+*.map
+.DS_Store
+.env
+local-dashboard/data/config.json
+local-dashboard/data/payments.json
+node_modules/
+deliverables/
+tmp/
+__pycache__/
+*.pyc
+.platformio-core/

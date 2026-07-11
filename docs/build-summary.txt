@@ -1,0 +1,28 @@
+PaymentESP Hardware Delivery Build Summary
+Date: 2026-06-28
+
+Host PromptPay tests: PASS
+Dashboard integration tests: PASS
+PlatformIO esp32dev build: PASS
+PlatformIO wokwi build: PASS
+
+Environment: esp32dev
+Framework: Arduino
+PlatformIO Core: 6.1.19
+RAM: 50,408 / 327,680 bytes (15.4%)
+Flash: 1,052,917 / 1,310,720 bytes (80.3%)
+
+Hardware features:
+- PaymentESP-Setup access point fallback
+- WiFi, PromptPay ID and Webhook stored in ESP32 NVS
+- paymentesp.local mDNS hostname
+- OLED network/setup status
+- Hardware and Wokwi build environments separated
+
+Generated artifacts:
+- firmware.bin
+- firmware.elf
+- bootloader.bin
+- partitions.bin
+
+Physical upload status: PENDING (no ESP32 serial device connected during packaging)

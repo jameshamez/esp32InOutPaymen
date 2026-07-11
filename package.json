@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "dashboard": "node local-dashboard/server.js",
+    "test:dashboard": "node tests/test_dashboard.js",
+    "test:omise": "node tests/test_omise.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
