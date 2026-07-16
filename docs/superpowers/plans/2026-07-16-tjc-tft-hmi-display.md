@@ -16,6 +16,12 @@
 - Every render function must explicitly set `qr0` (to a payload or to `""`) — TFT components persist independently, unlike the OLED's implicit full-screen clear.
 - `qrcode.h` / `buildQrCode()` stays in `main.cpp` — still used by `qrSvgFromText()` for the web UI's `/api/qr.svg`, untouched by this plan.
 - No touch input handling, no multi-page navigation — out of scope (see spec).
+- `main.cpp` also carries in-progress, uncommitted 2-pin payment-pulse (GPIO26/GPIO27) and P-Points
+  5-second monitor code (`twoPinPulseMode`, `processPpointsMonitor`, `handlePulseConfig`,
+  `handlePpointsMonitor`, etc.). None of it touches display rendering or GPIO16/17 — leave it
+  untouched. Task 2's "replace" snippets were re-verified against the current file with this code
+  present; if a snippet fails to match exactly when implementing, stop and re-read the surrounding
+  function rather than approximating the edit.
 
 ---
 
@@ -469,6 +475,11 @@ void renderPpointsExpired(const std::string& total, const std::string& count) {
 
 - [ ] **Step 7: Rewrite `renderCustomerQrStatus`**
 
+Note: this function's body is not a byte-for-byte match of the other render functions' vintage —
+it picked up a "compact vs full-size QR" branch (`compactQr`) in the in-progress pulse/monitor
+work already on disk. The replacement below still removes all of it, since the TFT's `qr0`
+component handles its own sizing and this pixel-scaling logic has no TFT equivalent.
+
 Replace:
 
 ```cpp
@@ -491,8 +502,9 @@ void renderCustomerQrStatus(const std::string& bankId,
     const int maxQrPixels = 42;
     const int scale = std::max(1, maxQrPixels / qrcode.size);
     const int qrPixels = qrcode.size * scale;
-    const int offsetX = 2;
-    const int offsetY = (SCREEN_HEIGHT - qrPixels) / 2;
+    const bool compactQr = qrPixels <= maxQrPixels;
+    const int offsetX = compactQr ? 2 : (SCREEN_WIDTH - qrcode.size) / 2;
+    const int offsetY = compactQr ? (SCREEN_HEIGHT - qrPixels) / 2 : (SCREEN_HEIGHT - qrcode.size) / 2;
 
     for (uint8_t y = 0; y < qrcode.size; ++y) {
       for (uint8_t x = 0; x < qrcode.size; ++x) {
@@ -500,6 +512,11 @@ void renderCustomerQrStatus(const std::string& bankId,
           display.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, SSD1306_WHITE);
         }
       }
+    }
+
+    if (!compactQr) {
+      display.display();
+      return;
     }
   }
 
