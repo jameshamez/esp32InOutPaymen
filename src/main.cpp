@@ -48,10 +48,12 @@ constexpr int SCREEN_WIDTH = 128;
 constexpr int SCREEN_HEIGHT = 64;
 constexpr int OLED_RESET = -1;
 constexpr int PAYMENT_PULSE_PIN = 26;
+constexpr int PAYMENT_PULSE_TENS_PIN = 27;
 constexpr unsigned long PAYMENT_PULSE_DURATION_MS = 500;
 constexpr unsigned long PAYMENT_PULSE_GAP_MS = 250;
 constexpr unsigned long PPOINTS_QR_TTL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long PPOINTS_POLL_INTERVAL_MS = 5000;
+constexpr unsigned long PPOINTS_MONITOR_INTERVAL_MS = 5000;
 constexpr int MAX_PAYMENT_PULSES = 200;
 
 WebServer server(80);
@@ -68,9 +70,13 @@ bool setupMode = false;
 bool paymentPulseActive = false;
 bool paymentPulseHigh = false;
 unsigned long paymentPulseNextAt = 0;
+int paymentPulseCurrentPin = PAYMENT_PULSE_PIN;
 int paymentPulsesPending = 0;
 int paymentPulsesCompleted = 0;
 int paymentPulsesTotal = 0;
+int paymentPulsesOnes = 0;
+int paymentPulsesTens = 0;
+std::deque<int> paymentPulseQueue;
 std::string lastPaymentId;
 std::string lastPaymentAmount;
 std::string lastPaymentReference;
@@ -80,6 +86,14 @@ double lastPpointsTotalAmount = 0.0;
 std::string lastPpointsCount;
 bool ppointsSessionActive = false;
 unsigned long ppointsSessionExpiresAt = 0;
+bool twoPinPulseMode = false;
+bool ppointsMonitorEnabled = true;
+unsigned long ppointsMonitorIntervalMs = PPOINTS_MONITOR_INTERVAL_MS;
+unsigned long ppointsMonitorNextAt = 0;
+unsigned long ppointsMonitorChecks = 0;
+std::string ppointsMonitorStationId = DEFAULT_PPOINTS_STATION_ID;
+std::string ppointsMonitorBankId = DEFAULT_PPOINTS_BANK_ID;
+std::string ppointsMonitorLastError;
 
 std::string shortenForDisplay(const std::string& value, size_t maxLength = 10) {
   if (value.size() <= maxLength) {
@@ -249,6 +263,10 @@ void loadPersistedConfig() {
   preferences.begin(PREFERENCES_NAMESPACE, false);
   wifiSsid = preferences.getString(PREFERENCES_WIFI_SSID_KEY, DEFAULT_WIFI_SSID);
   wifiPassword = preferences.getString(PREFERENCES_WIFI_PASSWORD_KEY, DEFAULT_WIFI_PASSWORD);
+#ifdef PAYMENTESP_WOKWI
+  wifiSsid = DEFAULT_WIFI_SSID;
+  wifiPassword = DEFAULT_WIFI_PASSWORD;
+#endif
 
   const String saved = preferences.getString(PREFERENCES_ID_KEY, DEFAULT_PROMPTPAY_ID);
   std::string error;
@@ -478,8 +496,9 @@ void renderCustomerQrStatus(const std::string& bankId,
     const int maxQrPixels = 42;
     const int scale = std::max(1, maxQrPixels / qrcode.size);
     const int qrPixels = qrcode.size * scale;
-    const int offsetX = 2;
-    const int offsetY = (SCREEN_HEIGHT - qrPixels) / 2;
+    const bool compactQr = qrPixels <= maxQrPixels;
+    const int offsetX = compactQr ? 2 : (SCREEN_WIDTH - qrcode.size) / 2;
+    const int offsetY = compactQr ? (SCREEN_HEIGHT - qrPixels) / 2 : (SCREEN_HEIGHT - qrcode.size) / 2;
 
     for (uint8_t y = 0; y < qrcode.size; ++y) {
       for (uint8_t x = 0; x < qrcode.size; ++x) {
@@ -487,6 +506,11 @@ void renderCustomerQrStatus(const std::string& bankId,
           display.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, SSD1306_WHITE);
         }
       }
+    }
+
+    if (!compactQr) {
+      display.display();
+      return;
     }
   }
 
@@ -534,18 +558,65 @@ int pulseCountFromAmount(const std::string& amount) {
   return std::min(std::max(pulses, 1), MAX_PAYMENT_PULSES);
 }
 
-void startPaymentPulses(int count) {
-  const int safeCount = std::min(std::max(count, 1), MAX_PAYMENT_PULSES);
-  digitalWrite(PAYMENT_PULSE_PIN, LOW);
-  paymentPulseActive = true;
-  paymentPulseHigh = false;
-  paymentPulseNextAt = millis();
-  paymentPulsesPending = safeCount;
-  paymentPulsesCompleted = 0;
-  paymentPulsesTotal = safeCount;
+int wholeBahtFromAmount(const std::string& amount) {
+  const double value = String(amount.c_str()).toDouble();
+  if (value <= 0.0) {
+    return 0;
+  }
+  return std::min(static_cast<int>(value), MAX_PAYMENT_PULSES);
+}
 
-  Serial.print("Pulse count queued: ");
+void enqueuePulsePin(int pin, int count) {
+  const int safeCount = std::min(std::max(count, 0), MAX_PAYMENT_PULSES);
+  for (int i = 0; i < safeCount; ++i) {
+    paymentPulseQueue.push_back(pin);
+  }
+}
+
+void startPaymentPulsesForAmount(const std::string& amount) {
+  paymentPulseQueue.clear();
+  digitalWrite(PAYMENT_PULSE_PIN, LOW);
+  digitalWrite(PAYMENT_PULSE_TENS_PIN, LOW);
+  paymentPulseHigh = false;
+  paymentPulsesCompleted = 0;
+  paymentPulsesOnes = 0;
+  paymentPulsesTens = 0;
+
+  if (twoPinPulseMode) {
+    const int wholeBaht = wholeBahtFromAmount(amount);
+    paymentPulsesTens = wholeBaht / 10;
+    paymentPulsesOnes = wholeBaht % 10;
+    enqueuePulsePin(PAYMENT_PULSE_TENS_PIN, paymentPulsesTens);
+    enqueuePulsePin(PAYMENT_PULSE_PIN, paymentPulsesOnes);
+  } else {
+    paymentPulsesOnes = pulseCountFromAmount(amount);
+    enqueuePulsePin(PAYMENT_PULSE_PIN, paymentPulsesOnes);
+  }
+
+  paymentPulsesTotal = static_cast<int>(paymentPulseQueue.size());
+  paymentPulsesPending = paymentPulsesTotal;
+  if (paymentPulsesPending <= 0) {
+    paymentPulseActive = false;
+    return;
+  }
+
+  digitalWrite(PAYMENT_PULSE_PIN, LOW);
+  digitalWrite(PAYMENT_PULSE_TENS_PIN, LOW);
+  paymentPulseActive = true;
+  paymentPulseNextAt = millis();
+
+  Serial.print("Pulse mode: ");
+  Serial.println(twoPinPulseMode ? "2-pin (ones + tens)" : "1-pin (1 baht/pulse)");
+  Serial.print("Pulse queued total: ");
   Serial.println(paymentPulsesTotal);
+  Serial.print("Pulse ones GPIO ");
+  Serial.print(PAYMENT_PULSE_PIN);
+  Serial.print(": ");
+  Serial.println(paymentPulsesOnes);
+  Serial.print("Pulse tens GPIO ");
+  Serial.print(PAYMENT_PULSE_TENS_PIN);
+  Serial.print(": ");
+  Serial.println(paymentPulsesTens);
 }
 
 void processPaymentPulses() {
@@ -554,11 +625,11 @@ void processPaymentPulses() {
   }
 
   if (paymentPulseHigh) {
-    digitalWrite(PAYMENT_PULSE_PIN, LOW);
+    digitalWrite(paymentPulseCurrentPin, LOW);
     paymentPulseHigh = false;
     ++paymentPulsesCompleted;
 
-    if (paymentPulsesPending <= 0) {
+    if (paymentPulseQueue.empty()) {
       paymentPulseActive = false;
       Serial.print("Pulse complete: ");
       Serial.println(paymentPulsesCompleted);
@@ -569,7 +640,9 @@ void processPaymentPulses() {
     return;
   }
 
-  digitalWrite(PAYMENT_PULSE_PIN, HIGH);
+  paymentPulseCurrentPin = paymentPulseQueue.front();
+  paymentPulseQueue.pop_front();
+  digitalWrite(paymentPulseCurrentPin, HIGH);
   paymentPulseHigh = true;
   --paymentPulsesPending;
   paymentPulseNextAt = millis() + PAYMENT_PULSE_DURATION_MS;
@@ -586,7 +659,7 @@ bool confirmPayment(const std::string& paymentId,
   lastPaymentId = paymentId;
   lastPaymentAmount = amount;
   lastPaymentReference = reference;
-  startPaymentPulses(pulseCountFromAmount(amount));
+  startPaymentPulsesForAmount(amount);
 
   Serial.println();
   Serial.println("=== PAYMENT CONFIRMED ===");
@@ -598,9 +671,11 @@ bool confirmPayment(const std::string& paymentId,
   Serial.println(lastPaymentAmount.c_str());
   Serial.print("Reference: ");
   Serial.println(lastPaymentReference.c_str());
-  Serial.print("Pulse GPIO: ");
+  Serial.print("Pulse GPIO ones: ");
   Serial.println(PAYMENT_PULSE_PIN);
-  Serial.print("Pulse count: ");
+  Serial.print("Pulse GPIO tens: ");
+  Serial.println(PAYMENT_PULSE_TENS_PIN);
+  Serial.print("Pulse count total: ");
   Serial.println(paymentPulsesTotal);
   Serial.println("=========================");
   renderPaymentConfirmed(lastPaymentAmount, lastPaymentReference);
@@ -899,7 +974,7 @@ void handleRoot() {
       "<title>ESP32 PromptPay QR</title>"
       "<style>body{font-family:Arial,sans-serif;max-width:820px;margin:20px auto;padding:0 16px;line-height:1.45;background:#f7f7f8;color:#111}"
       "h1{margin:0 0 12px}.panel{background:white;border:1px solid #ddd;border-radius:8px;padding:16px;margin-bottom:14px}"
-      "input,button{font:inherit;padding:11px;margin:4px 0;width:100%;box-sizing:border-box}"
+      "input,button,select{font:inherit;padding:11px;margin:4px 0;width:100%;box-sizing:border-box}"
       "button{cursor:pointer;border:0;border-radius:6px;background:#0f766e;color:white;font-weight:700}"
       "button.secondary{background:#334155}.qrwrap{display:flex;justify-content:center;align-items:center;min-height:330px}"
       "button.active{outline:3px solid #f59e0b;outline-offset:2px}.status{font-weight:700;color:#0f766e}"
@@ -915,27 +990,36 @@ void handleRoot() {
       "<div class='row'><button class='secondary' name='mode' value='static'>Static QR</button>"
       "<button name='mode' value='dynamic'>Dynamic QR</button></div>"
       "<button class='secondary' name='mode' value='config'>Save PromptPay ID</button></form></div>"
-      "<div class='panel'><h2>P-Points Direct</h2>"
+      "<div class='panel'><h2>GenQR</h2>"
+      "<label>P-Points QR Payload</label><input id='ppPayload' value='00020101021129390016A000000677010111031500499907526116353037645802TH6304E345'>"
+      "<label>Amount</label><input id='ppAmount' value='15.00' inputmode='decimal'>"
+      "<div class='row'><button id='ppGen' type='button'>GenQR</button>"
+      "<button id='ppStatic' type='button' class='secondary'>Static QR</button></div>"
+      "<div class='row'><button id='ppApply' type='button' class='secondary'>Apply QR Changes</button>"
+      "<button id='ppDynamic' type='button'>P-Points Dynamic QR</button></div>"
+      "<button id='ppShow' type='button' class='secondary'>Show Current QR on OLED</button>"
+      "<p id='ppAuto'>GenQR uses only P-Points QR Payload + Amount.</p>"
+      "<p class='note'>GenQR only creates and displays QR. It does not change stn_id, bank_id, baseline, monitor, or pulse checking.</p></div>"
+      "<div class='panel'><h2>P-Points Check / Monitor</h2>"
       "<label>stn_id</label><input id='ppStn' value='S-24001'>"
       "<label>bank_id</label><input id='ppBank' value='X-9786'>"
-      "<label>P-Points Amount</label><input id='ppAmount' value='15.00' inputmode='decimal'>"
-      "<label>P-Points QR Payload</label><input id='ppPayload' value='00020101021129390016A000000677010111031500499907526116353037645802TH6304E345'>"
-      "<div class='row'><button id='ppStatic' type='button' class='secondary'>P-Points Static QR</button>"
-      "<button id='ppDynamic' type='button'>P-Points Dynamic QR</button></div>"
-      "<div class='row'><button id='ppCheck' type='button'>Check P-Points Pay-in</button>"
-      "<button id='ppShow' type='button' class='secondary'>Show QR Mode</button></div>"
-      "<p id='ppAuto'>Auto check idle</p>"
-      "<p class='note'>P-Points Static/Dynamic QR keeps the QR on OLED while auto checking every 5 seconds for 5 minutes. The OLED changes only when payment is detected or the session expires.</p></div>"
+      "<label>Pulse Mode</label><select id='pulseMode'><option value='1pin'>1 pin: 1 baht / pulse</option><option value='2pin'>2 pins: A=ones, B=10 baht/pulse</option></select>"
+      "<button id='ppCheck' type='button'>Check P-Points Pay-in</button>"
+      "<div class='row'><button id='monitorStart' type='button'>Restart 5-sec Monitor</button>"
+      "<button id='monitorStop' type='button' class='secondary'>Stop Monitor</button></div>"
+      "<p id='monitorStatus'>Monitor auto starting...</p>"
+      "<p class='note'>Monitor checks P-Points by stn_id + bank_id every 5 seconds and sends pulse only when a new pay-in amount is detected.</p></div>"
       "<div class='panel'><p id='qrStatus' class='status'>QR idle</p></div>"
       "<div class='panel qrwrap'><img id='qr' alt='PromptPay QR'></div>"
       "<div class='panel'><pre id='out'>Ready</pre></div>"
-      "<script>let latestPayload='';let latestQrMode='dynamic';let ppPollTimer=0;let ppCountdownTimer=0;let ppExpiresAt=0;let ppCheckCount=0;let ppMaxChecks=60;function show(j){document.getElementById('out').textContent=JSON.stringify(j,null,2)}"
+      "<script>let latestPayload='';let latestQrMode='dynamic';let qrSeq=0;let ppPollTimer=0;let ppCountdownTimer=0;let ppExpiresAt=0;let ppCheckCount=0;let ppMaxChecks=60;function show(j){document.getElementById('out').textContent=JSON.stringify(j,null,2)}"
       "function setQrStatus(t){document.getElementById('qrStatus').textContent=t}"
-      "function setPpActive(mode){document.getElementById('ppStatic').classList.toggle('active',mode==='static');document.getElementById('ppDynamic').classList.toggle('active',mode==='dynamic')}"
-      "function setQrImage(payload,label){latestPayload=payload;let img=document.getElementById('qr');img.style.opacity='1';img.src='/api/qr.svg?data='+encodeURIComponent(payload)+'&t='+Date.now();setQrStatus(label+' | payload '+payload.length+' chars | crc '+payload.slice(-4))}"
+      "function setPpActive(mode){document.getElementById('ppStatic').classList.toggle('active',mode==='static');document.getElementById('ppDynamic').classList.toggle('active',mode==='dynamic');document.getElementById('ppGen').classList.toggle('active',mode==='dynamic')}"
+      "function placeholderQr(label){qrSeq++;let svg='<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"330\" height=\"330\"><rect width=\"330\" height=\"330\" fill=\"white\"/><rect x=\"10\" y=\"10\" width=\"310\" height=\"310\" fill=\"#f8fafc\" stroke=\"#0f766e\" stroke-width=\"6\"/><text x=\"165\" y=\"145\" font-family=\"Arial\" font-size=\"34\" font-weight=\"700\" text-anchor=\"middle\" fill=\"#0f172a\">'+label+'</text><text x=\"165\" y=\"188\" font-family=\"Arial\" font-size=\"18\" text-anchor=\"middle\" fill=\"#475569\">loading QR #'+qrSeq+'</text></svg>';let img=document.getElementById('qr');img.style.opacity='1';img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);setQrStatus(label+' selected | loading #'+qrSeq)}"
+      "function setQrImage(payload,label){latestPayload=payload;let img=document.getElementById('qr');img.style.opacity='1';img.src='/api/qr.svg?data='+encodeURIComponent(payload)+'&t='+Date.now()+'&seq='+qrSeq;setQrStatus(label+' | payload '+payload.length+' chars | crc '+payload.slice(-4)+' | #'+qrSeq)}"
       "async function loadConfig(){let r=await fetch('/api/config');let j=await r.json();document.getElementById('promptpay').value=j.promptPayId||'';document.getElementById('webhook').value=j.webhookUrl||'';document.getElementById('network').textContent=(j.setupMode?'Setup mode: ':'Ready: ')+(j.ip||'no IP')+' | '+(j.hostname||'paymentesp.local')}"
       "async function generateQr(mode){let form=document.getElementById('form');let p=new URLSearchParams(new FormData(form));let r=await fetch('/api/'+mode+'?'+p);let j=await r.json();show(j);if(j.payload){latestQrMode=mode;setQrImage(j.payload,'PromptPay '+mode.toUpperCase())}return j}"
-      "async function generatePpointsQr(mode){setPpActive(mode);setQrStatus('Generating P-Points '+mode.toUpperCase()+' QR...');document.getElementById('qr').style.opacity='0.35';let p=new URLSearchParams({mode:mode,payload:document.getElementById('ppPayload').value});if(mode==='dynamic')p.set('amount',document.getElementById('ppAmount').value||'1.00');let r=await fetch('/api/ppoints/qr?'+p);let j=await r.json();show(j);if(j.payload){latestQrMode=mode;setQrImage(j.payload,'P-Points '+mode.toUpperCase()+(mode==='dynamic'?' THB '+(j.amount||document.getElementById('ppAmount').value):' no amount'))}return j}"
+      "async function generatePpointsQr(mode){latestQrMode=mode;setPpActive(mode);placeholderQr('P-Points '+mode.toUpperCase());let p=new URLSearchParams({mode:mode,payload:document.getElementById('ppPayload').value});if(mode==='dynamic')p.set('amount',document.getElementById('ppAmount').value||'1.00');let r=await fetch('/api/ppoints/qr?'+p);let j=await r.json();show(j);if(j.payload){setQrImage(j.payload,'P-Points '+mode.toUpperCase()+(mode==='dynamic'?' THB '+(j.amount||document.getElementById('ppAmount').value):' no amount'))}return j}"
       "async function generateDynamic(){return generateQr('dynamic')}"
       "document.getElementById('form').onsubmit=async e=>{e.preventDefault();let mode=e.submitter.value;"
       "let p=new URLSearchParams(new FormData(e.target));let r;"
@@ -943,19 +1027,34 @@ void handleRoot() {
       "else{let b=mode==='dynamic'?'/api/dynamic':'/api/static';r=await fetch(b+'?'+p)}"
       "let j=await r.json();show(j);"
       "if(j.payload){latestQrMode=mode;setQrImage(j.payload,'PromptPay '+mode.toUpperCase())}};"
-      "async function showCustomerQr(){if(!latestPayload)await generateDynamic();let p=new URLSearchParams({stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value,ref:'PPOINTS-'+latestQrMode.toUpperCase(),payload:latestPayload});let r=await fetch('/api/customer-qr?'+p);return await r.json()}"
+      "async function showCustomerQr(){if(!latestPayload)await generatePpointsQr('dynamic');let p=new URLSearchParams({stn_id:latestQrMode.toUpperCase(),bank_id:'GENQR',ref:'PPOINTS-'+latestQrMode.toUpperCase(),payload:latestPayload});let r=await fetch('/api/customer-qr?'+p);return await r.json()}"
       "async function setPpointsBaseline(){let p=new URLSearchParams({stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value});let r=await fetch('/api/ppoints/baseline?'+p);return await r.json()}"
+      "async function savePulseMode(){let p=new URLSearchParams({mode:document.getElementById('pulseMode').value});let r=await fetch('/api/pulse/config?'+p);return await r.json()}"
+      "function showMonitorStatus(j){document.getElementById('monitorStatus').textContent='Monitor '+(j.enabled?'ON':'OFF')+' | '+(j.intervalMs/1000)+'s | next '+Math.ceil((j.nextInMs||0)/1000)+'s | checks '+j.checks+' | pulse '+j.pulseMode+' | last '+(j.lastTotal||'-')+(j.lastError?' | error '+j.lastError:'')}"
+      "async function monitor(action){let p=new URLSearchParams({action:action,stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value,interval_ms:'5000'});let pulse=await savePulseMode();let r=await fetch('/api/ppoints/monitor?'+p);let j=await r.json();showMonitorStatus(j);show({pulse:pulse,monitor:j});return j}"
+      "async function refreshMonitor(){let r=await fetch('/api/ppoints/monitor?action=status');let j=await r.json();showMonitorStatus(j);return j}"
+      "async function applyQrChanges(){let qr=await generatePpointsQr(latestQrMode==='static'?'static':'dynamic');let oled=await showCustomerQr();show({qr:qr,oled:oled,note:'P-Points QR updated after pressing Apply QR Changes.'})}"
+      "let ppFieldTimer=0;function schedulePpointsApply(kind){clearTimeout(ppFieldTimer);ppFieldTimer=setTimeout(async()=>{try{if(kind==='pulse'){show({pulse:await savePulseMode(),note:'Pulse mode updated immediately.'});return}if(kind==='monitor'){let j=await monitor('start');show({monitor:j,note:'P-Points station/bank updated. Baseline reset.'});return}setQrStatus('QR settings changed. Press Apply QR Changes.');show({pending:true,note:'Amount/Payload changed. Press Apply QR Changes to regenerate QR.'})}catch(e){show({error:e.message})}},500)}"
       "function stopPpointsAuto(msg){if(ppPollTimer)clearInterval(ppPollTimer);if(ppCountdownTimer)clearInterval(ppCountdownTimer);ppPollTimer=0;ppCountdownTimer=0;ppExpiresAt=0;if(msg)document.getElementById('ppAuto').textContent=msg}"
       "function updatePpointsCountdown(){let ms=ppExpiresAt-Date.now();if(ms<=0){document.getElementById('qr').style.opacity='0.35';stopPpointsAuto('QR expired. Generate a new P-Points QR.');return}document.getElementById('ppAuto').textContent='Auto checking '+latestQrMode.toUpperCase()+' | check '+ppCheckCount+'/'+ppMaxChecks+' | expires in '+Math.ceil(ms/1000)+'s'}"
       "async function checkPpoints(auto=false){let p=new URLSearchParams({stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value});let r=await fetch('/api/ppoints/check?'+p);let j=await r.json();if(!auto)show(j);return j}"
       "async function pollPpoints(){if(!ppExpiresAt||Date.now()>=ppExpiresAt){document.getElementById('qr').style.opacity='0.35';stopPpointsAuto('QR expired. Generate a new P-Points QR.');show({ok:false,expired:true,note:'QR session expired after 5 minutes.'});return}ppCheckCount++;updatePpointsCountdown();let j=await checkPpoints(true);show(Object.assign({autoCheck:true,checkCount:ppCheckCount,maxChecks:ppMaxChecks,qrMode:latestQrMode},j));if(j.pulseTriggered||Number(j.delta)>0){document.getElementById('qr').style.opacity='0.35';stopPpointsAuto('Payment detected. Pulse sent.');show(Object.assign({autoCheck:true,checkCount:ppCheckCount,note:'Payment detected. Pulse sent.'},j))}else if(j.sessionExpired){document.getElementById('qr').style.opacity='0.35';stopPpointsAuto('QR expired. Generate a new P-Points QR.')}}"
       "function startPpointsAuto(baseline){stopPpointsAuto();ppCheckCount=0;ppMaxChecks=Math.max(1,Math.ceil((baseline.expiresInMs||300000)/(baseline.pollIntervalMs||5000)));ppExpiresAt=Date.now()+(baseline.expiresInMs||300000);updatePpointsCountdown();ppCountdownTimer=setInterval(updatePpointsCountdown,1000);ppPollTimer=setInterval(()=>pollPpoints().catch(e=>show({autoCheck:true,error:e.message})),baseline.pollIntervalMs||5000)}"
-      "async function preparePpointsQr(mode){let qr=await generatePpointsQr(mode);let oled=await showCustomerQr();let baseline=await setPpointsBaseline();if(baseline.ok)startPpointsAuto(baseline);else stopPpointsAuto('Could not save baseline from P-Points.');show({ok:!!baseline.ok,qr:qr,oled:oled,baseline:baseline,amount:mode==='dynamic'?document.getElementById('ppAmount').value:'static-no-amount',note:baseline.ok?'Baseline saved. Auto checking every 5 seconds for 5 minutes.':'Could not save baseline from P-Points.'})}"
+      "async function preparePpointsQr(mode){let qr=await generatePpointsQr(mode);let oled=await showCustomerQr();stopPpointsAuto('QR displayed. Monitor keeps checking separately.');show({ok:!!qr.payload,qr:qr,oled:oled,amount:mode==='dynamic'?document.getElementById('ppAmount').value:'static-no-amount',note:'GenQR uses only payload and amount. Monitor/pulse checking is separate.'})}"
+      "document.getElementById('ppGen').onclick=async()=>preparePpointsQr('dynamic');"
       "document.getElementById('ppStatic').onclick=async()=>preparePpointsQr('static');"
       "document.getElementById('ppDynamic').onclick=async()=>preparePpointsQr('dynamic');"
       "document.getElementById('ppShow').onclick=async()=>show(await showCustomerQr());"
+      "document.getElementById('ppApply').onclick=()=>applyQrChanges();"
       "document.getElementById('ppCheck').onclick=()=>checkPpoints(false);"
-      "loadConfig().then(()=>setQrStatus('Choose P-Points Static or Dynamic QR'));</script>"
+      "document.getElementById('monitorStart').onclick=()=>monitor('start');"
+      "document.getElementById('monitorStop').onclick=()=>monitor('stop');"
+      "document.getElementById('ppAmount').oninput=()=>schedulePpointsApply('qr');"
+      "document.getElementById('ppPayload').oninput=()=>schedulePpointsApply('qr');"
+      "document.getElementById('ppStn').oninput=()=>schedulePpointsApply('monitor');"
+      "document.getElementById('ppBank').oninput=()=>schedulePpointsApply('monitor');"
+      "document.getElementById('pulseMode').onchange=()=>schedulePpointsApply('pulse');"
+      "loadConfig().then(()=>{setQrStatus('Choose P-Points Static or Dynamic QR');refreshMonitor();setInterval(()=>refreshMonitor().catch(()=>{}),5000)});</script>"
       "</body></html>";
   server.send(200, "text/html", html);
 }
@@ -1015,10 +1114,15 @@ void handlePpointsQr() {
     return;
   }
 
+  const std::string stationId = argOrDefault("stn_id", dynamicQr ? "DYNAMIC" : "STATIC").c_str();
+  const std::string bankId = argOrDefault("bank_id", "GENQR").c_str();
+  renderCustomerQrStatus(bankId, stationId, dynamicQr ? "PPOINTS-DYNAMIC" : "PPOINTS-STATIC", payload);
+
   std::string body = "{";
   body += "\"mode\":\"ppoints-" + std::string(dynamicQr ? "dynamic" : "static") + "\",";
   body += "\"source\":\"p-points-template\",";
   body += "\"amount\":\"" + jsonEscape(dynamicQr ? formatMoney(amount) : "") + "\",";
+  body += "\"oledRendered\":true,";
   body += "\"templateCrcValid\":" + std::string(hasValidPromptPayCrc(templatePayload) ? "true" : "false") + ",";
   body += "\"payload\":\"" + jsonEscape(payload) + "\"";
   body += "}";
@@ -1285,6 +1389,161 @@ void handlePpointsCheck() {
   sendPpointsPaymentResponse(parsed, stationId, bankId, "ESP32 P-Points API");
 }
 
+std::string processPpointsMonitorResult(const PpointsResult& result,
+                                        const std::string& stationId,
+                                        const std::string& bankId,
+                                        bool& baseline,
+                                        bool& pulseTriggered,
+                                        std::string& deltaText) {
+  baseline = false;
+  pulseTriggered = false;
+  deltaText = "0.00";
+  if (!result.ok) {
+    return "";
+  }
+
+  const double currentTotal = String(result.amount.c_str()).toDouble();
+  const std::string count = result.count.empty() ? std::to_string(millis()) : result.count;
+  if (!hasPpointsPreviousTotal) {
+    hasPpointsPreviousTotal = true;
+    lastPpointsTotalAmount = currentTotal;
+    lastPpointsCount = count;
+    baseline = true;
+    renderPpointsDelta(result.amount, "+0.00", count, true, false);
+    return "ppoints-monitor-baseline-" + stationId + "-" + bankId + "-" + count;
+  }
+
+  const double delta = currentTotal - lastPpointsTotalAmount;
+  char deltaBuffer[24];
+  std::snprintf(deltaBuffer, sizeof(deltaBuffer), "%+.2f", delta);
+  deltaText = deltaBuffer;
+
+  lastPpointsTotalAmount = currentTotal;
+  lastPpointsCount = count;
+
+  const std::string paymentId = "ppoints-monitor-delta-" + stationId + "-" + bankId + "-" + count + "-" + deltaText;
+  if (delta > 0.0 && paymentId != lastPaymentId) {
+    const std::string deltaAmount = formatMoney(delta);
+    confirmPayment(paymentId, deltaAmount, "PPOINTS-MONITOR-" + count, "ESP32 P-Points 5min Monitor");
+    pulseTriggered = true;
+  }
+  return paymentId;
+}
+
+std::string ppointsMonitorStatusJson() {
+  const unsigned long nextInMs =
+      ppointsMonitorEnabled && static_cast<long>(ppointsMonitorNextAt - millis()) > 0 ? ppointsMonitorNextAt - millis()
+                                                                                       : 0;
+  std::string body = "{";
+  body += "\"ok\":true,";
+  body += "\"enabled\":" + std::string(ppointsMonitorEnabled ? "true" : "false") + ",";
+  body += "\"stationId\":\"" + jsonEscape(ppointsMonitorStationId) + "\",";
+  body += "\"bankId\":\"" + jsonEscape(ppointsMonitorBankId) + "\",";
+  body += "\"intervalMs\":" + std::to_string(ppointsMonitorIntervalMs) + ",";
+  body += "\"nextInMs\":" + std::to_string(nextInMs) + ",";
+  body += "\"checks\":" + std::to_string(ppointsMonitorChecks) + ",";
+  body += "\"lastTotal\":\"" + jsonEscape(hasPpointsPreviousTotal ? formatMoney(lastPpointsTotalAmount) : "") + "\",";
+  body += "\"lastCount\":\"" + jsonEscape(lastPpointsCount) + "\",";
+  body += "\"lastError\":\"" + jsonEscape(ppointsMonitorLastError) + "\",";
+  body += "\"pulseMode\":\"" + std::string(twoPinPulseMode ? "two-pin" : "one-pin") + "\",";
+  body += "\"pulseOnesPin\":" + std::to_string(PAYMENT_PULSE_PIN) + ",";
+  body += "\"pulseTensPin\":" + std::to_string(PAYMENT_PULSE_TENS_PIN);
+  body += "}";
+  return body;
+}
+
+void handlePulseConfig() {
+  if (server.hasArg("mode")) {
+    const std::string mode = server.arg("mode").c_str();
+    if (mode == "2pin" || mode == "two-pin") {
+      twoPinPulseMode = true;
+    } else if (mode == "1pin" || mode == "one-pin") {
+      twoPinPulseMode = false;
+    } else {
+      sendJson("{\"error\":\"mode must be 1pin or 2pin\"}", 400);
+      return;
+    }
+  }
+
+  std::string body = "{";
+  body += "\"ok\":true,";
+  body += "\"pulseMode\":\"" + std::string(twoPinPulseMode ? "two-pin" : "one-pin") + "\",";
+  body += "\"pulseOnesPin\":" + std::to_string(PAYMENT_PULSE_PIN) + ",";
+  body += "\"pulseTensPin\":" + std::to_string(PAYMENT_PULSE_TENS_PIN);
+  body += "}";
+  sendJson(body);
+}
+
+void handlePpointsMonitor() {
+  const std::string action = argOrDefault("action", "status").c_str();
+  if (action == "start") {
+    ppointsMonitorStationId = argOrDefault("stn_id", DEFAULT_PPOINTS_STATION_ID).c_str();
+    ppointsMonitorBankId = argOrDefault("bank_id", DEFAULT_PPOINTS_BANK_ID).c_str();
+    const long requestedIntervalMs = argOrDefault("interval_ms", String(PPOINTS_MONITOR_INTERVAL_MS)).toInt();
+    ppointsMonitorIntervalMs = static_cast<unsigned long>(std::max(5000L, requestedIntervalMs));
+    ppointsMonitorEnabled = true;
+    ppointsMonitorNextAt = millis();
+    ppointsMonitorChecks = 0;
+    ppointsMonitorLastError.clear();
+    hasPpointsPreviousTotal = false;
+    lastPpointsTotalAmount = 0.0;
+    lastPpointsCount.clear();
+    ppointsSessionActive = false;
+    sendJson(ppointsMonitorStatusJson());
+    return;
+  }
+
+  if (action == "stop") {
+    ppointsMonitorEnabled = false;
+    sendJson(ppointsMonitorStatusJson());
+    return;
+  }
+
+  sendJson(ppointsMonitorStatusJson());
+}
+
+void processPpointsMonitor() {
+  if (!ppointsMonitorEnabled || static_cast<long>(millis() - ppointsMonitorNextAt) < 0) {
+    return;
+  }
+
+  ppointsMonitorNextAt = millis() + ppointsMonitorIntervalMs;
+  ++ppointsMonitorChecks;
+
+  PpointsResult parsed;
+  int status = 0;
+  std::string error;
+  if (!fetchPpointsResult(ppointsMonitorStationId, ppointsMonitorBankId, parsed, status, error)) {
+    ppointsMonitorLastError = error.empty() ? "P-Points request failed" : error;
+    Serial.print("P-Points monitor error: ");
+    Serial.println(ppointsMonitorLastError.c_str());
+    return;
+  }
+
+  bool baseline = false;
+  bool pulseTriggered = false;
+  std::string deltaText;
+  const std::string paymentId = processPpointsMonitorResult(parsed, ppointsMonitorStationId, ppointsMonitorBankId,
+                                                            baseline, pulseTriggered, deltaText);
+  ppointsMonitorLastError.clear();
+
+  Serial.println();
+  Serial.println("=== P-POINTS MONITOR ===");
+  Serial.print("Check: ");
+  Serial.println(ppointsMonitorChecks);
+  Serial.print("Payment ID: ");
+  Serial.println(paymentId.c_str());
+  Serial.print("Total: ");
+  Serial.println(parsed.amount.c_str());
+  Serial.print("Delta: ");
+  Serial.println(deltaText.c_str());
+  Serial.print("Baseline: ");
+  Serial.println(baseline ? "yes" : "no");
+  Serial.print("Pulse: ");
+  Serial.println(pulseTriggered ? "yes" : "no");
+  Serial.println("========================");
+}
+
 void handleNotFound() {
   sendJson("{\"error\":\"not found\"}", 404);
 }
@@ -1452,7 +1711,9 @@ void setup() {
   Serial.println("ESP32 PromptPay QR Payment");
   loadPersistedConfig();
   pinMode(PAYMENT_PULSE_PIN, OUTPUT);
+  pinMode(PAYMENT_PULSE_TENS_PIN, OUTPUT);
   digitalWrite(PAYMENT_PULSE_PIN, LOW);
+  digitalWrite(PAYMENT_PULSE_TENS_PIN, LOW);
   setupDisplay();
 
   connectWifi();
@@ -1474,6 +1735,8 @@ void setup() {
   server.on("/api/ppoints/mock", HTTP_GET, handlePpointsMock);
   server.on("/api/ppoints/baseline", HTTP_GET, handlePpointsBaseline);
   server.on("/api/ppoints/check", HTTP_GET, handlePpointsCheck);
+  server.on("/api/ppoints/monitor", HTTP_GET, handlePpointsMonitor);
+  server.on("/api/pulse/config", HTTP_GET, handlePulseConfig);
   server.on("/api/payment", HTTP_GET, handlePaymentConfirmation);
   server.on("/api/payment", HTTP_POST, handlePaymentConfirmation);
   server.onNotFound(handleNotFound);
@@ -1486,5 +1749,6 @@ void setup() {
 void loop() {
   server.handleClient();
   processSerialSimulator();
+  processPpointsMonitor();
   processPaymentPulses();
 }
