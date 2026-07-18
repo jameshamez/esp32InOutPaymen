@@ -23,3 +23,13 @@ std::string buildHmiTextCommand(const std::string& component, const std::string&
   command += '\xFF';
   return command;
 }
+
+std::string buildHmiFillCommand(int x, int y, int width, int height, int color) {
+  std::string command = "fill " + std::to_string(x) + "," + std::to_string(y) + "," +
+                         std::to_string(width) + "," + std::to_string(height) + "," +
+                         std::to_string(color);
+  command += '\xFF';
+  command += '\xFF';
+  command += '\xFF';
+  return command;
+}

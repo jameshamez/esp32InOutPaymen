@@ -44,7 +44,10 @@ constexpr const char* PPOINTS_BASE_URL = "https://p-points.com/sms_payin_rd.php"
 constexpr size_t MAX_LOGS = 20;
 constexpr int DISPLAY_UART_RX_PIN = 16;
 constexpr int DISPLAY_UART_TX_PIN = 17;
-constexpr unsigned long DISPLAY_UART_BAUD = 9600;
+constexpr unsigned long DISPLAY_UART_BAUD = 115200;
+constexpr int QR_AREA_X = 10;
+constexpr int QR_AREA_Y = 10;
+constexpr int QR_AREA_SIZE = 280;
 constexpr int PAYMENT_PULSE_PIN = 26;
 constexpr int PAYMENT_PULSE_TENS_PIN = 27;
 constexpr unsigned long PAYMENT_PULSE_DURATION_MS = 500;
@@ -371,17 +374,50 @@ void sendToDisplay(const std::string& component, const std::string& value) {
   Serial2.write(reinterpret_cast<const uint8_t*>(command.data()), command.size());
 }
 
+void sendFillToDisplay(int x, int y, int width, int height, int color) {
+  if (!displayReady) {
+    return;
+  }
+  const std::string command = buildHmiFillCommand(x, y, width, height, color);
+  Serial2.write(reinterpret_cast<const uint8_t*>(command.data()), command.size());
+}
+
+void clearQrArea() {
+  sendFillToDisplay(QR_AREA_X, QR_AREA_Y, QR_AREA_SIZE, QR_AREA_SIZE, 65535);
+}
+
 void sendQrToDisplay(const std::string& payload) {
   if (payload.empty()) {
-    sendToDisplay("qr0", "");
+    clearQrArea();
     return;
   }
-  if (payload.size() > DISPLAY_QR_MAX_LEN) {
-    sendToDisplay("t0", "QR too long");
-    sendToDisplay("qr0", "");
+
+  QRCode qrcode;
+  std::vector<uint8_t> buffer;
+  if (!buildQrCode(payload, qrcode, buffer)) {
+    sendToDisplay("t0", "QR too large");
+    clearQrArea();
     return;
   }
-  sendToDisplay("qr0", payload);
+
+  clearQrArea();
+  const int scale = std::max(1, QR_AREA_SIZE / qrcode.size);
+  for (uint8_t y = 0; y < qrcode.size; ++y) {
+    uint8_t x = 0;
+    while (x < qrcode.size) {
+      if (!qrcode_getModule(&qrcode, x, y)) {
+        ++x;
+        continue;
+      }
+      const uint8_t runStart = x;
+      while (x < qrcode.size && qrcode_getModule(&qrcode, x, y)) {
+        ++x;
+      }
+      const int runLength = x - runStart;
+      sendFillToDisplay(QR_AREA_X + runStart * scale, QR_AREA_Y + y * scale,
+                         runLength * scale, scale, 0);
+    }
+  }
 }
 
 void renderEventToOled(const QrEvent& event) {
@@ -397,7 +433,7 @@ void renderPaymentConfirmed(const std::string& amount, const std::string& refere
   sendToDisplay("t1", "THB " + amount);
   sendToDisplay("t2", reference);
   sendToDisplay("t3", "");
-  sendToDisplay("qr0", "");
+  clearQrArea();
 }
 
 void renderPpointsDelta(const std::string& total,
@@ -410,7 +446,7 @@ void renderPpointsDelta(const std::string& total,
   sendToDisplay("t2", "Diff " + delta);
   const std::string status = baseline ? "Baseline" : (pulseTriggered ? "Pulse OK" : "No pulse");
   sendToDisplay("t3", "Count " + count + " " + status);
-  sendToDisplay("qr0", "");
+  clearQrArea();
 }
 
 void renderPpointsExpired(const std::string& total, const std::string& count) {
@@ -418,7 +454,7 @@ void renderPpointsExpired(const std::string& total, const std::string& count) {
   sendToDisplay("t1", "QR expired");
   sendToDisplay("t2", "Total " + total);
   sendToDisplay("t3", "Count " + count);
-  sendToDisplay("qr0", "");
+  clearQrArea();
 }
 
 void renderCustomerQrStatus(const std::string& bankId,
@@ -1504,7 +1540,7 @@ void setupDisplay() {
   sendToDisplay("t1", "Booting...");
   sendToDisplay("t2", "");
   sendToDisplay("t3", "");
-  sendToDisplay("qr0", "");
+  clearQrArea();
 }
 
 void renderNetworkStatus() {
@@ -1519,7 +1555,7 @@ void renderNetworkStatus() {
     sendToDisplay("t2", "paymentesp.local");
     sendToDisplay("t3", "Open browser");
   }
-  sendToDisplay("qr0", "");
+  clearQrArea();
 }
 
 void printSimulatorHelp() {
