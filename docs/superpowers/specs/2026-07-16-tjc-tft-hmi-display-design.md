@@ -1,5 +1,30 @@
 # TJC TFT HMI display support — design
 
+## Revision (post-implementation): QR rendering changed from native component to pixel-fill drawing
+
+The original design (below) sent the QR payload as text to the display's built-in `qr0`
+QRcode component. The final whole-branch code review measured real PromptPay payloads at
+92–105 characters (dynamic/static QR with a reference) and found that TJC's "T1 series"
+(the tier `TJC4832T135` belongs to) caps the QRcode component's text input at **84 bytes
+of hardware limit** — confirmed against TJC/Nextion's own documented Basic-tier limit, not
+just this firmware's `DISPLAY_QR_MAX_LEN` guard. Real payloads exceed that hardware ceiling
+in the two most common cases (dynamic QR, static QR with a reference); only "static, no
+reference" (74 chars) reliably fit.
+
+Decision (user-approved): stop using the native `qr0` component entirely. Draw the QR as
+filled-rectangle blocks directly onto the page background instead, using Nextion's native
+`fill x,y,width,height,color` instruction — the same approach the original SSD1306 OLED
+code used (`display.fillRect` per module), just sent as UART draw commands instead of I2C
+pixel writes. This has no text-length ceiling at all (capacity is governed by
+`buildQrCode()`'s existing QR-version-6-to-15 range, same as the OLED always had), so the
+84-byte limit no longer applies. Baud rate raised from 9600 to 115200 to keep draw time
+reasonable (~40-60 fill commands after row run-length-encoding, vs. up to hundreds of
+individual module commands unencoded).
+
+**Consequence:** the display-side component contract below no longer needs a `qr0`
+QRcode component at all — only `t0`-`t3` Text components. `DISPLAY_QR_MAX_LEN` is removed.
+See "Architecture" for the updated `sendQrToDisplay` design.
+
 ## Context
 
 PaymentESP firmware (`src/main.cpp`) currently drives a 128x64 SSD1306 OLED over I2C
@@ -26,9 +51,9 @@ These are the ESP32's standard hardware `Serial2` pins — no custom pin remap n
 - `GPIO26` (payment pulse output) — untouched
 - `GPIO0/1` a.k.a. `TX0`/`RX0` (USB serial, used for flashing/Serial Monitor) — untouched
 
-Baud rate: **9600**, matching TJC/Nextion factory default. The USART HMI Editor project
-must be configured for 9600 baud to match (documented as a setup step, not enforced by
-firmware).
+Baud rate: **115200** (revised — see revision note above; was 9600 in the original design).
+The USART HMI Editor project must be configured for 115200 baud to match (documented as a
+setup step, not enforced by firmware).
 
 ## Display-side component contract
 
@@ -37,14 +62,18 @@ component names:
 
 | Component | Type | Purpose |
 |---|---|---|
-| `qr0` | QRcode | Shows the current PromptPay/P-Points QR payload |
 | `t0` | Text | Title / status line (e.g. "PromptPay QR", "PAID", "P-Points") |
 | `t1` | Text | Line 2 (mode / amount / IP) |
 | `t2` | Text | Line 3 (amount / reference / count) |
 | `t3` | Text | Line 4 (reference / hostname / extra status) |
 
+No `qr0` QRcode component is needed (see revision note) — the QR is drawn as filled
+rectangles directly on the page background within a reserved area:
+**x=10, y=10, 280x280 pixels**. The user's `t0`-`t3` placement in the editor must not
+overlap that rectangle (e.g. place text starting at x=300).
+
 No other pages or components are required. Firmware never sends a page-switch command
-(`page N`) — everything happens by updating text on page 0.
+(`page N`) — everything happens by updating text/drawing on page 0.
 
 ## Architecture
 
@@ -59,9 +88,14 @@ Framework-independent (no Arduino/ESP32 headers), following the same pattern as
 // Escapes backslash and double-quote in value. No trailing newline.
 std::string buildHmiTextCommand(const std::string& component, const std::string& value);
 
-// Safety cap applied by callers before building a qr0 command.
-constexpr size_t DISPLAY_QR_MAX_LEN = 80;
+// Builds a Nextion/TJC "fill" draw command as raw bytes ready to write to the UART:
+//   fill <x>,<y>,<width>,<height>,<color><0xFF><0xFF><0xFF>
+// color is a 16-bit RGB565 value (0 = black, 65535 = white). No validation of
+// coordinate ranges — callers are responsible for staying on-screen.
+std::string buildHmiFillCommand(int x, int y, int width, int height, int color);
 ```
+
+(`DISPLAY_QR_MAX_LEN` from the original design is removed — see revision note.)
 
 `main.cpp` owns the actual `Serial2.write()` call; `DisplayHMI.cpp` only builds byte
 strings, no I/O, so it can be unit tested the same way `PromptPayQR.cpp` is.
@@ -81,28 +115,41 @@ strings, no I/O, so it can be unit tested the same way `PromptPayQR.cpp` is.
   the protocol has no reliable handshake to check for at boot).
 - Rewrite all 7 render functions to send text updates instead of drawing pixels:
 
-  | Function | `t0` | `t1` | `t2` | `t3` | `qr0` |
+  | Function | `t0` | `t1` | `t2` | `t3` | QR area |
   |---|---|---|---|---|---|
-  | `renderEventToOled` | "PromptPay" | mode (Dynamic/Static) | amount | reference | payload (guarded by `DISPLAY_QR_MAX_LEN`, else `t0="QR too long"` and skip) |
-  | `renderPaymentConfirmed` | "PAID" | "THB " + amount | reference | "" | "" (clear — original OLED redraw never shows a QR here) |
-  | `renderPpointsDelta` | "P-Points" | "Total " + total | "Diff " + delta | count + baseline/pulse status | "" (clear — original OLED redraw never shows a QR here) |
-  | `renderPpointsExpired` | "P-Points" | "QR expired" | "Total " + total | "Count " + count | "" (clear) |
-  | `renderCustomerQrStatus` | "P-Points" | bankId | stationId | reference | payload if non-empty (same length guard), else "" (clear) — matches original's conditional `buildQrCode` call |
-  | `renderNetworkStatus` (setupMode) | "PaymentESP SETUP" | AP SSID | "PASS: " + password | setup URL | "" |
-  | `renderNetworkStatus` (connected) | "PaymentESP READY" | local IP | "paymentesp.local" | "Open browser" | "" |
+  | `renderEventToOled` | "PromptPay" | mode (Dynamic/Static) | amount | reference | draw payload (see below), or `t0="QR too large"` if no QR version 6-15 fits |
+  | `renderPaymentConfirmed` | "PAID" | "THB " + amount | reference | "" | clear (white fill) — original OLED redraw never shows a QR here |
+  | `renderPpointsDelta` | "P-Points" | "Total " + total | "Diff " + delta | count + baseline/pulse status | clear (white fill) |
+  | `renderPpointsExpired` | "P-Points" | "QR expired" | "Total " + total | "Count " + count | clear (white fill) |
+  | `renderCustomerQrStatus` | "P-Points" | bankId | stationId | reference | draw payload if non-empty, else clear — matches original's conditional `buildQrCode` call |
+  | `renderNetworkStatus` (setupMode) | "PaymentESP SETUP" | AP SSID | "PASS: " + password | setup URL | clear (white fill) |
+  | `renderNetworkStatus` (connected) | "PaymentESP READY" | local IP | "paymentesp.local" | "Open browser" | clear (white fill) |
 
-  Every render function explicitly sets `qr0` (either to a payload or to `""`) rather
-  than leaving it untouched — unlike the OLED's implicit full-screen `clearDisplay()`,
-  the TFT's components persist independently, so a stale QR would stay on screen if a
-  later render call forgot to clear it.
+  Every render function explicitly clears or redraws the QR area rather than leaving it
+  untouched — unlike the OLED's implicit full-screen `clearDisplay()`, the TFT's drawn
+  pixels persist independently of text-component updates, so a stale QR would stay on
+  screen if a later render call forgot to clear it.
 
-  Boot message in `setupDisplay()` becomes a single `sendToDisplay("t0", "Booting...")` (or similar), no OLED-specific init.
+  Boot message in `setupDisplay()` becomes `sendToDisplay("t0", "Booting...")` plus a
+  clear of the QR area, no OLED-specific init.
+
+  **`sendQrToDisplay(payload)` algorithm** (replaces the text-based version):
+  1. Call the existing `buildQrCode(payload, qrcode, buffer)` (unchanged, still shared
+     with `qrSvgFromText()`). If it returns false (no version 6-15 fits), send
+     `t0="QR too large"` and return — same fallback message the OLED used.
+  2. Clear the reserved area: `fill 10,10,280,280,65535` (white).
+  3. Compute `scale = max(1, 280 / qrcode.size)`.
+  4. For each module row, scan left to right and run-length-encode contiguous dark
+     modules into a single `fill` command per run (`fill x,y,runLength*scale,scale,0`)
+     instead of one command per module — cuts command count roughly in half to a
+     quarter for typical QR patterns, keeping draw time reasonable at 115200 baud.
 
 ### Tests
 
 - `tests/test_display_hmi.cpp` (host-native, same style as `tests/test_promptpay.cpp`):
   asserts `buildHmiTextCommand` produces the correct `component.txt="value"` + 3×`0xFF`
-  byte sequence, and that `"` / `\` in the value are escaped.
+  byte sequence, that `"` / `\` in the value are escaped, and that `buildHmiFillCommand`
+  produces the correct `fill x,y,width,height,color` + 3×`0xFF` byte sequence.
 - Existing `tests/test_promptpay.cpp` is unaffected (PromptPayQR.cpp untouched).
 - No hardware-in-the-loop test — visual verification on the real TJC display is manual,
   same as the current OLED workflow.
@@ -117,6 +164,8 @@ strings, no I/O, so it can be unit tested the same way `PromptPayQR.cpp` is.
 ## Manual steps required from the user (not doable by this agent)
 
 1. Download/install `USART HMI.exe` from https://tjc1688.com.
-2. Create a new project targeting TJC4832T135, set UART baud to 9600.
-3. Add components named exactly `qr0`, `t0`, `t1`, `t2`, `t3` on page 0.
+2. Create a new project targeting TJC4832T135, set UART baud to **115200**.
+3. Add Text components named exactly `t0`, `t1`, `t2`, `t3` on page 0, positioned so
+   none overlap the reserved QR drawing area (x=10, y=10, 280x280 pixels) — e.g. start
+   text components at x=300 or further right.
 4. Compile and upload the resulting `.tft` file to the display over serial.
