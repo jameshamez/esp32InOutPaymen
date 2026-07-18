@@ -1,12 +1,9 @@
 #include <HTTPClient.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <Wire.h>
 #include <qrcode.h>
 
 #include <algorithm>
@@ -16,6 +13,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "DisplayHMI.h"
 #include "PromptPayQR.h"
 
 namespace {
@@ -44,9 +42,9 @@ constexpr const char* DEFAULT_PPOINTS_QR_PAYLOAD =
     "00020101021129390016A000000677010111031500499907526116353037645802TH6304E345";
 constexpr const char* PPOINTS_BASE_URL = "https://p-points.com/sms_payin_rd.php";
 constexpr size_t MAX_LOGS = 20;
-constexpr int SCREEN_WIDTH = 128;
-constexpr int SCREEN_HEIGHT = 64;
-constexpr int OLED_RESET = -1;
+constexpr int DISPLAY_UART_RX_PIN = 16;
+constexpr int DISPLAY_UART_TX_PIN = 17;
+constexpr unsigned long DISPLAY_UART_BAUD = 9600;
 constexpr int PAYMENT_PULSE_PIN = 26;
 constexpr int PAYMENT_PULSE_TENS_PIN = 27;
 constexpr unsigned long PAYMENT_PULSE_DURATION_MS = 500;
@@ -57,7 +55,6 @@ constexpr unsigned long PPOINTS_MONITOR_INTERVAL_MS = 5000;
 constexpr int MAX_PAYMENT_PULSES = 200;
 
 WebServer server(80);
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 Preferences preferences;
 PromptPayConfig qrConfig{DEFAULT_PROMPTPAY_ID, "PROMPTPAY", "BANGKOK"};
 std::string webhookUrl = DEFAULT_WEBHOOK_URL;
@@ -366,66 +363,41 @@ bool buildQrCode(const std::string& text, QRCode& qrcode, std::vector<uint8_t>& 
   return false;
 }
 
-void renderEventToOled(const QrEvent& event) {
+void sendToDisplay(const std::string& component, const std::string& value) {
   if (!displayReady) {
     return;
   }
+  const std::string command = buildHmiTextCommand(component, value);
+  Serial2.write(reinterpret_cast<const uint8_t*>(command.data()), command.size());
+}
 
-  QRCode qrcode;
-  std::vector<uint8_t> buffer;
-
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-
-  if (!buildQrCode(event.payload, qrcode, buffer)) {
-    display.setCursor(0, 0);
-    display.println("QR too large");
-    display.display();
+void sendQrToDisplay(const std::string& payload) {
+  if (payload.empty()) {
+    sendToDisplay("qr0", "");
     return;
   }
-
-  const int maxQrPixels = 56;
-  const int scale = std::max(1, maxQrPixels / qrcode.size);
-  const int qrPixels = qrcode.size * scale;
-  const int offsetX = 2;
-  const int offsetY = (SCREEN_HEIGHT - qrPixels) / 2;
-
-  for (uint8_t y = 0; y < qrcode.size; ++y) {
-    for (uint8_t x = 0; x < qrcode.size; ++x) {
-      if (qrcode_getModule(&qrcode, x, y)) {
-        display.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, SSD1306_WHITE);
-      }
-    }
+  if (payload.size() > DISPLAY_QR_MAX_LEN) {
+    sendToDisplay("t0", "QR too long");
+    sendToDisplay("qr0", "");
+    return;
   }
+  sendToDisplay("qr0", payload);
+}
 
-  display.setTextSize(1);
-  display.setCursor(64, 4);
-  display.println("PromptPay");
-  display.setCursor(64, 18);
-  display.println(event.mode == "dynamic" ? "Dynamic" : "Static");
-  display.setCursor(64, 32);
-  display.println(event.amount.empty() ? "No amount" : event.amount.c_str());
-  display.setCursor(64, 46);
-  display.println(event.reference.c_str());
-  display.display();
+void renderEventToOled(const QrEvent& event) {
+  sendToDisplay("t0", "PromptPay");
+  sendToDisplay("t1", event.mode == "dynamic" ? "Dynamic" : "Static");
+  sendToDisplay("t2", event.amount.empty() ? "No amount" : event.amount);
+  sendToDisplay("t3", event.reference);
+  sendQrToDisplay(event.payload);
 }
 
 void renderPaymentConfirmed(const std::string& amount, const std::string& reference) {
-  if (!displayReady) {
-    return;
-  }
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-  display.println("PAID");
-  display.setTextSize(1);
-  display.setCursor(0, 28);
-  display.print("THB ");
-  display.println(amount.c_str());
-  display.setCursor(0, 44);
-  display.println(reference.c_str());
-  display.display();
+  sendToDisplay("t0", "PAID");
+  sendToDisplay("t1", "THB " + amount);
+  sendToDisplay("t2", reference);
+  sendToDisplay("t3", "");
+  sendToDisplay("qr0", "");
 }
 
 void renderPpointsDelta(const std::string& total,
@@ -433,96 +405,31 @@ void renderPpointsDelta(const std::string& total,
                         const std::string& count,
                         bool baseline,
                         bool pulseTriggered) {
-  if (!displayReady) {
-    return;
-  }
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("P-Points");
-  display.setCursor(0, 14);
-  display.print("Total ");
-  display.println(total.c_str());
-  display.setCursor(0, 28);
-  display.print("Diff ");
-  display.println(delta.c_str());
-  display.setCursor(0, 42);
-  display.print("Count ");
-  display.println(count.c_str());
-  display.setCursor(0, 56);
-  display.println(baseline ? "Baseline" : (pulseTriggered ? "Pulse OK" : "No pulse"));
-  display.display();
+  sendToDisplay("t0", "P-Points");
+  sendToDisplay("t1", "Total " + total);
+  sendToDisplay("t2", "Diff " + delta);
+  const std::string status = baseline ? "Baseline" : (pulseTriggered ? "Pulse OK" : "No pulse");
+  sendToDisplay("t3", "Count " + count + " " + status);
+  sendToDisplay("qr0", "");
 }
 
 void renderPpointsExpired(const std::string& total, const std::string& count) {
-  if (!displayReady) {
-    return;
-  }
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("P-Points");
-  display.setCursor(0, 14);
-  display.println("QR expired");
-  display.setCursor(0, 28);
-  display.print("Total ");
-  display.println(total.c_str());
-  display.setCursor(0, 42);
-  display.print("Count ");
-  display.println(count.c_str());
-  display.setCursor(0, 56);
-  display.println("Create new QR");
-  display.display();
+  sendToDisplay("t0", "P-Points");
+  sendToDisplay("t1", "QR expired");
+  sendToDisplay("t2", "Total " + total);
+  sendToDisplay("t3", "Count " + count);
+  sendToDisplay("qr0", "");
 }
 
 void renderCustomerQrStatus(const std::string& bankId,
                             const std::string& stationId,
                             const std::string& reference,
                             const std::string& payload) {
-  if (!displayReady) {
-    return;
-  }
-
-  QRCode qrcode;
-  std::vector<uint8_t> buffer;
-
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-
-  if (!payload.empty() && buildQrCode(payload, qrcode, buffer)) {
-    const int maxQrPixels = 42;
-    const int scale = std::max(1, maxQrPixels / qrcode.size);
-    const int qrPixels = qrcode.size * scale;
-    const bool compactQr = qrPixels <= maxQrPixels;
-    const int offsetX = compactQr ? 2 : (SCREEN_WIDTH - qrcode.size) / 2;
-    const int offsetY = compactQr ? (SCREEN_HEIGHT - qrPixels) / 2 : (SCREEN_HEIGHT - qrcode.size) / 2;
-
-    for (uint8_t y = 0; y < qrcode.size; ++y) {
-      for (uint8_t x = 0; x < qrcode.size; ++x) {
-        if (qrcode_getModule(&qrcode, x, y)) {
-          display.fillRect(offsetX + x * scale, offsetY + y * scale, scale, scale, SSD1306_WHITE);
-        }
-      }
-    }
-
-    if (!compactQr) {
-      display.display();
-      return;
-    }
-  }
-
-  display.setCursor(50, 0);
-  display.println("P-Points");
-  display.setCursor(50, 14);
-  display.println(shortenForDisplay(bankId, 12).c_str());
-  display.setCursor(50, 28);
-  display.println(shortenForDisplay(stationId, 12).c_str());
-  display.setCursor(50, 42);
-  display.println(shortenForDisplay(reference, 12).c_str());
-  display.display();
+  sendToDisplay("t0", "P-Points");
+  sendToDisplay("t1", shortenForDisplay(bankId, 12));
+  sendToDisplay("t2", shortenForDisplay(stationId, 12));
+  sendToDisplay("t3", shortenForDisplay(reference, 12));
+  sendQrToDisplay(payload);
 }
 
 double extractAmountFromText(const String& text) {
@@ -1591,42 +1498,28 @@ void connectWifi() {
 }
 
 void setupDisplay() {
-  Wire.begin(21, 22);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println("SSD1306 display not found.");
-    return;
-  }
-
+  Serial2.begin(DISPLAY_UART_BAUD, SERIAL_8N1, DISPLAY_UART_RX_PIN, DISPLAY_UART_TX_PIN);
   displayReady = true;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("PromptPay QR");
-  display.println("Booting...");
-  display.display();
+  sendToDisplay("t0", "PromptPay QR");
+  sendToDisplay("t1", "Booting...");
+  sendToDisplay("t2", "");
+  sendToDisplay("t3", "");
+  sendToDisplay("qr0", "");
 }
 
 void renderNetworkStatus() {
-  if (!displayReady) {
-    return;
-  }
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.setCursor(0, 0);
   if (setupMode) {
-    display.println("PaymentESP SETUP");
-    display.println(SETUP_AP_SSID);
-    display.println("PASS: paymentesp");
-    display.println("192.168.4.1/setup");
+    sendToDisplay("t0", "PaymentESP SETUP");
+    sendToDisplay("t1", SETUP_AP_SSID);
+    sendToDisplay("t2", "PASS: paymentesp");
+    sendToDisplay("t3", "192.168.4.1/setup");
   } else {
-    display.println("PaymentESP READY");
-    display.println(WiFi.localIP());
-    display.println("paymentesp.local");
-    display.println("Open browser");
+    sendToDisplay("t0", "PaymentESP READY");
+    sendToDisplay("t1", std::string(WiFi.localIP().toString().c_str()));
+    sendToDisplay("t2", "paymentesp.local");
+    sendToDisplay("t3", "Open browser");
   }
-  display.display();
+  sendToDisplay("qr0", "");
 }
 
 void printSimulatorHelp() {
