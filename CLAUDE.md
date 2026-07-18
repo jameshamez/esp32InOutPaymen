@@ -25,6 +25,13 @@ g++ -std=c++17 -Iinclude tests/test_promptpay.cpp src/PromptPayQR.cpp -o /tmp/pa
 
 This compiles `PromptPayQR.cpp` (the PromptPay TLV/QR payload logic) standalone against `tests/test_promptpay.cpp`, independent of the Arduino/ESP32 framework in `src/main.cpp`.
 
+The same pattern applies to `DisplayHMI.cpp` (Nextion/TJC UART command formatting):
+
+```bash
+g++ -std=c++17 -Iinclude tests/test_display_hmi.cpp src/DisplayHMI.cpp -o /tmp/paymentesp-test-hmi
+/tmp/paymentesp-test-hmi
+```
+
 ### Local dashboard (Node.js, no dependencies beyond `qrcode`)
 
 ```bash
@@ -51,7 +58,7 @@ Then open `diagram.json` in VS Code and run "Wokwi: Start Simulator" (`wokwi.tom
   - **Config & persistence**: WiFi SSID/password, PromptPay ID, and webhook URL are stored in NVS via `Preferences` (namespace `promptpay`) and loaded in `loadPersistedConfig()`.
   - **WiFi bootstrap**: `connectWifi()` tries the saved STA credentials; on failure it falls back to a `PaymentESP-Setup` AP (open at `192.168.4.1/setup`) served by the same `WebServer` instance, gated by `setupMode`.
   - **HTTP routes**: registered in `setup()` — `/`, `/setup`, and the `/api/*` endpoints listed in README.md. Handlers are `handleXxx()` functions in the same file; there's no router abstraction.
-  - **OLED rendering**: `render*()` functions (`renderEventToOled`, `renderPaymentConfirmed`, `renderPpointsDelta`, `renderCustomerQrStatus`, etc.) draw directly via Adafruit GFX; the QR itself is rasterized with the `qrcode` library and blitted as filled rects.
+  - **Display rendering**: `render*()` functions (`renderEventToOled`, `renderPaymentConfirmed`, `renderPpointsDelta`, `renderCustomerQrStatus`, `renderNetworkStatus`, etc.) send Nextion/TJC protocol UART text commands (`include/DisplayHMI.h`/`src/DisplayHMI.cpp`, host-testable like `PromptPayQR.h`/`.cpp`) to a TJC4832T135 touchscreen over `Serial2` (GPIO16 RX2 / GPIO17 TX2, 9600 baud) — the display renders its own QR code and text via a fixed set of components (`qr0`, `t0`-`t3`) that must exist in the `.tft` project uploaded to the display through TJC's USART HMI Editor. `qrcode.h`/`buildQrCode()` is still used separately for `qrSvgFromText()` (the web UI's `/api/qr.svg`).
   - **Payment confirmation / GPIO pulse**: `confirmPayment()` dedupes by `paymentId` and triggers `startPaymentPulses()`, which drives GPIO 26 with a non-blocking state machine (`processPaymentPulses()`, called every `loop()`) — one pulse per whole THB, capped at `MAX_PAYMENT_PULSES`.
   - **P-Points integration**: a polling flow against `https://p-points.com/sms_payin_rd.php` (`fetchPpointsResult` → `parsePpointsResponse` → `processPpointsResult`). It records a baseline total (`hasPpointsPreviousTotal`/`lastPpointsTotalAmount`), then a 5-minute session (`ppointsSessionActive`/`ppointsSessionExpiresAt`, `PPOINTS_QR_TTL_MS`) during which the OLED holds the QR while the frontend polls `/api/ppoints/check` every `PPOINTS_POLL_INTERVAL_MS`. A positive delta from baseline triggers `confirmPayment` (pulse); the session expires without pulsing if no increase is seen in time. This mirrors what the Node dashboard does for local-only testing.
   - **Serial SMS simulator**: `processSerialSimulator()`/`processSerialCommand()` reads lines from Serial (`PAY 15`, `SMS: ...`) for testing payment confirmation without real P-Points calls — useful in Wokwi.
