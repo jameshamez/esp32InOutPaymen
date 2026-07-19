@@ -69,8 +69,10 @@ component names:
 
 No `qr0` QRcode component is needed (see revision note) — the QR is drawn as filled
 rectangles directly on the page background within a reserved area:
-**x=10, y=10, 280x280 pixels**. The user's `t0`-`t3` placement in the editor must not
-overlap that rectangle (e.g. place text starting at x=300).
+**x=190, y=30, 280x280 pixels** (bottom-right of the 480x320 screen — moved from the
+original top-left x=10,y=10 placement at user request). The user's `t0`-`t3` placement in
+the editor must not overlap that rectangle (e.g. place text in the remaining top-left
+area, x=0-180 or y=0-20).
 
 No other pages or components are required. Firmware never sends a page-switch command
 (`page N`) — everything happens by updating text/drawing on page 0.
@@ -166,6 +168,6 @@ strings, no I/O, so it can be unit tested the same way `PromptPayQR.cpp` is.
 1. Download/install `USART HMI.exe` from https://tjc1688.com.
 2. Create a new project targeting TJC4832T135, set UART baud to **115200**.
 3. Add Text components named exactly `t0`, `t1`, `t2`, `t3` on page 0, positioned so
-   none overlap the reserved QR drawing area (x=10, y=10, 280x280 pixels) — e.g. start
-   text components at x=300 or further right.
+   none overlap the reserved QR drawing area (x=190, y=30, 280x280 pixels, bottom-right
+   of the screen) — e.g. place text in the top-left area.
 4. Compile and upload the resulting `.tft` file to the display over serial.

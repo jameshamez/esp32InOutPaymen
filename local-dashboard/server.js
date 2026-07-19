@@ -21,7 +21,7 @@ const PORT = Number(process.env.DASHBOARD_PORT || 3001);
 const DEFAULT_DEVICE_URL = process.env.ESP32_BASE_URL || "http://paymentesp.local";
 const DEFAULT_PROMPTPAY_ID = process.env.PROMPTPAY_ID || "0812345678";
 const DEFAULT_WEBHOOK_URL = process.env.WEBHOOK_URL || "";
-const DEFAULT_PPOINTS_STATION_ID = process.env.PPOINTS_STATION_ID || "S-24001";
+const DEFAULT_PPOINTS_STATION_ID = process.env.PPOINTS_STATION_ID || "P-24001";
 const DEFAULT_PPOINTS_BANK_ID = process.env.PPOINTS_BANK_ID || "X-9786";
 const PPOINTS_BASE_URL = process.env.PPOINTS_BASE_URL || "https://p-points.com/sms_payin_rd.php";
 const CONFIG_FILE = process.env.DASHBOARD_CONFIG_FILE || path.join(__dirname, "data", "config.json");
@@ -725,7 +725,7 @@ function pageHtml() {
     <section>
       <h2>P-Points Pay-in</h2>
       <label for="ppointsStation">stn_id</label>
-      <input id="ppointsStation" value="${htmlEscape(dashboardConfig.ppointsStationId)}" placeholder="S-24001">
+      <input id="ppointsStation" value="${htmlEscape(dashboardConfig.ppointsStationId)}" placeholder="P-24001">
       <label for="ppointsBank">bank_id</label>
       <input id="ppointsBank" value="${htmlEscape(dashboardConfig.ppointsBankId)}" placeholder="X-9786">
       <div class="status">Checks unread pay-in amount from P-Points with flg=W, then sends paid status to ESP32.</div>

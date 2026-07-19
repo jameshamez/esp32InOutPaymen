@@ -36,7 +36,7 @@ constexpr const char* PREFERENCES_ID_KEY = "id";
 constexpr const char* PREFERENCES_WEBHOOK_KEY = "webhook";
 constexpr const char* PREFERENCES_WIFI_SSID_KEY = "wifiSsid";
 constexpr const char* PREFERENCES_WIFI_PASSWORD_KEY = "wifiPass";
-constexpr const char* DEFAULT_PPOINTS_STATION_ID = "S-24001";
+constexpr const char* DEFAULT_PPOINTS_STATION_ID = "P-24001";
 constexpr const char* DEFAULT_PPOINTS_BANK_ID = "X-9786";
 constexpr const char* DEFAULT_PPOINTS_QR_PAYLOAD =
     "00020101021129390016A000000677010111031500499907526116353037645802TH6304E345";
@@ -44,16 +44,17 @@ constexpr const char* PPOINTS_BASE_URL = "https://p-points.com/sms_payin_rd.php"
 constexpr size_t MAX_LOGS = 20;
 constexpr int DISPLAY_UART_RX_PIN = 16;
 constexpr int DISPLAY_UART_TX_PIN = 17;
-constexpr unsigned long DISPLAY_UART_BAUD = 115200;
-constexpr int QR_AREA_X = 10;
-constexpr int QR_AREA_Y = 10;
-constexpr int QR_AREA_SIZE = 280;
-constexpr int PAYMENT_PULSE_PIN = 26;
-constexpr int PAYMENT_PULSE_TENS_PIN = 27;
+constexpr unsigned long DISPLAY_UART_BAUD = 9600;
+constexpr int QR_AREA_X = 320;
+constexpr int QR_AREA_Y = 160;
+constexpr int QR_AREA_SIZE = 150;
+constexpr int PAYMENT_PULSE_PIN = 15;
+constexpr int PAYMENT_PULSE_TENS_PIN = 2;
 constexpr unsigned long PAYMENT_PULSE_DURATION_MS = 500;
 constexpr unsigned long PAYMENT_PULSE_GAP_MS = 250;
 constexpr unsigned long PPOINTS_QR_TTL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long PPOINTS_POLL_INTERVAL_MS = 5000;
+constexpr unsigned long WIFI_RECONNECT_INTERVAL_MS = 15000;
 constexpr unsigned long PPOINTS_MONITOR_INTERVAL_MS = 5000;
 constexpr int MAX_PAYMENT_PULSES = 200;
 
@@ -753,12 +754,12 @@ std::string processPpointsResult(const PpointsResult& result,
     return "ppoints-baseline-" + stationId + "-" + bankId + "-" + count;
   }
 
-  const double delta = currentTotal - lastPpointsTotalAmount;
+  const bool isNewRecord = count != lastPpointsCount || result.amount != formatMoney(lastPpointsTotalAmount);
   char deltaBuffer[24];
-  std::snprintf(deltaBuffer, sizeof(deltaBuffer), "%+.2f", delta);
+  std::snprintf(deltaBuffer, sizeof(deltaBuffer), "%+.2f", currentTotal - lastPpointsTotalAmount);
   deltaText = deltaBuffer;
 
-  const std::string paymentId = "ppoints-delta-" + stationId + "-" + bankId + "-" + count + "-" + deltaText;
+  const std::string paymentId = "ppoints-record-" + stationId + "-" + bankId + "-" + count + "-" + result.amount;
   const std::string reference = "PPOINTS-DIFF-" + count;
   if (paymentId == lastPaymentId) {
     duplicate = true;
@@ -768,9 +769,8 @@ std::string processPpointsResult(const PpointsResult& result,
   lastPpointsTotalAmount = currentTotal;
   lastPpointsCount = count;
 
-  if (delta > 0.0) {
-    const std::string deltaAmount = formatMoney(delta);
-    confirmPayment(paymentId, deltaAmount, reference, source);
+  if (isNewRecord && currentTotal > 0.0) {
+    confirmPayment(paymentId, result.amount, reference, source);
     ppointsSessionActive = false;
     pulseTriggered = true;
   }
@@ -926,13 +926,6 @@ void handleRoot() {
       ".row{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:640px){.row{grid-template-columns:1fr}}</style>"
       "</head><body><h1>ESP32 PromptPay QR</h1>"
       "<div class='panel'><b id='network'>Loading network status...</b><br><a href='/setup'>Hardware / WiFi Setup</a></div>"
-      "<div class='panel'><form id='form'><label>PromptPay ID</label><input id='promptpay' name='promptpay' value='' inputmode='numeric'>"
-      "<label>Webhook URL</label><input id='webhook' name='webhook' value='' placeholder='http://server/api/payment'>"
-      "<label>Amount</label><input name='amount' value='99.00' inputmode='decimal'>"
-      "<label>Reference</label><input name='ref' value='ORDER-0001'>"
-      "<div class='row'><button class='secondary' name='mode' value='static'>Static QR</button>"
-      "<button name='mode' value='dynamic'>Dynamic QR</button></div>"
-      "<button class='secondary' name='mode' value='config'>Save PromptPay ID</button></form></div>"
       "<div class='panel'><h2>GenQR</h2>"
       "<label>P-Points QR Payload</label><input id='ppPayload' value='00020101021129390016A000000677010111031500499907526116353037645802TH6304E345'>"
       "<label>Amount</label><input id='ppAmount' value='15.00' inputmode='decimal'>"
@@ -944,7 +937,7 @@ void handleRoot() {
       "<p id='ppAuto'>GenQR uses only P-Points QR Payload + Amount.</p>"
       "<p class='note'>GenQR only creates and displays QR. It does not change stn_id, bank_id, baseline, monitor, or pulse checking.</p></div>"
       "<div class='panel'><h2>P-Points Check / Monitor</h2>"
-      "<label>stn_id</label><input id='ppStn' value='S-24001'>"
+      "<label>stn_id</label><input id='ppStn' value='P-24001'>"
       "<label>bank_id</label><input id='ppBank' value='X-9786'>"
       "<label>Pulse Mode</label><select id='pulseMode'><option value='1pin'>1 pin: 1 baht / pulse</option><option value='2pin'>2 pins: A=ones, B=10 baht/pulse</option></select>"
       "<button id='ppCheck' type='button'>Check P-Points Pay-in</button>"
@@ -960,16 +953,8 @@ void handleRoot() {
       "function setPpActive(mode){document.getElementById('ppStatic').classList.toggle('active',mode==='static');document.getElementById('ppDynamic').classList.toggle('active',mode==='dynamic');document.getElementById('ppGen').classList.toggle('active',mode==='dynamic')}"
       "function placeholderQr(label){qrSeq++;let svg='<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"330\" height=\"330\"><rect width=\"330\" height=\"330\" fill=\"white\"/><rect x=\"10\" y=\"10\" width=\"310\" height=\"310\" fill=\"#f8fafc\" stroke=\"#0f766e\" stroke-width=\"6\"/><text x=\"165\" y=\"145\" font-family=\"Arial\" font-size=\"34\" font-weight=\"700\" text-anchor=\"middle\" fill=\"#0f172a\">'+label+'</text><text x=\"165\" y=\"188\" font-family=\"Arial\" font-size=\"18\" text-anchor=\"middle\" fill=\"#475569\">loading QR #'+qrSeq+'</text></svg>';let img=document.getElementById('qr');img.style.opacity='1';img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);setQrStatus(label+' selected | loading #'+qrSeq)}"
       "function setQrImage(payload,label){latestPayload=payload;let img=document.getElementById('qr');img.style.opacity='1';img.src='/api/qr.svg?data='+encodeURIComponent(payload)+'&t='+Date.now()+'&seq='+qrSeq;setQrStatus(label+' | payload '+payload.length+' chars | crc '+payload.slice(-4)+' | #'+qrSeq)}"
-      "async function loadConfig(){let r=await fetch('/api/config');let j=await r.json();document.getElementById('promptpay').value=j.promptPayId||'';document.getElementById('webhook').value=j.webhookUrl||'';document.getElementById('network').textContent=(j.setupMode?'Setup mode: ':'Ready: ')+(j.ip||'no IP')+' | '+(j.hostname||'paymentesp.local')}"
-      "async function generateQr(mode){let form=document.getElementById('form');let p=new URLSearchParams(new FormData(form));let r=await fetch('/api/'+mode+'?'+p);let j=await r.json();show(j);if(j.payload){latestQrMode=mode;setQrImage(j.payload,'PromptPay '+mode.toUpperCase())}return j}"
+      "async function loadConfig(){let r=await fetch('/api/config');let j=await r.json();document.getElementById('network').textContent=(j.setupMode?'Setup mode: ':'Ready: ')+(j.ip||'no IP')+' | '+(j.hostname||'paymentesp.local')}"
       "async function generatePpointsQr(mode){latestQrMode=mode;setPpActive(mode);placeholderQr('P-Points '+mode.toUpperCase());let p=new URLSearchParams({mode:mode,payload:document.getElementById('ppPayload').value});if(mode==='dynamic')p.set('amount',document.getElementById('ppAmount').value||'1.00');let r=await fetch('/api/ppoints/qr?'+p);let j=await r.json();show(j);if(j.payload){setQrImage(j.payload,'P-Points '+mode.toUpperCase()+(mode==='dynamic'?' THB '+(j.amount||document.getElementById('ppAmount').value):' no amount'))}return j}"
-      "async function generateDynamic(){return generateQr('dynamic')}"
-      "document.getElementById('form').onsubmit=async e=>{e.preventDefault();let mode=e.submitter.value;"
-      "let p=new URLSearchParams(new FormData(e.target));let r;"
-      "if(mode==='config'){r=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p})}"
-      "else{let b=mode==='dynamic'?'/api/dynamic':'/api/static';r=await fetch(b+'?'+p)}"
-      "let j=await r.json();show(j);"
-      "if(j.payload){latestQrMode=mode;setQrImage(j.payload,'PromptPay '+mode.toUpperCase())}};"
       "async function showCustomerQr(){if(!latestPayload)await generatePpointsQr('dynamic');let p=new URLSearchParams({stn_id:latestQrMode.toUpperCase(),bank_id:'GENQR',ref:'PPOINTS-'+latestQrMode.toUpperCase(),payload:latestPayload});let r=await fetch('/api/customer-qr?'+p);return await r.json()}"
       "async function setPpointsBaseline(){let p=new URLSearchParams({stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value});let r=await fetch('/api/ppoints/baseline?'+p);return await r.json()}"
       "async function savePulseMode(){let p=new URLSearchParams({mode:document.getElementById('pulseMode').value});let r=await fetch('/api/pulse/config?'+p);return await r.json()}"
@@ -1143,7 +1128,7 @@ void handlePaymentConfirmation() {
 
 void handleCustomerQr() {
   const std::string bankId = argOrDefault("bank_id", "X-9786").c_str();
-  const std::string stationId = argOrDefault("stn_id", "S-24001").c_str();
+  const std::string stationId = argOrDefault("stn_id", "P-24001").c_str();
   const std::string reference = argOrDefault("ref", "CUSTOMER-QR").c_str();
   const std::string payload = argOrDefault("payload", "").c_str();
 
@@ -1356,18 +1341,17 @@ std::string processPpointsMonitorResult(const PpointsResult& result,
     return "ppoints-monitor-baseline-" + stationId + "-" + bankId + "-" + count;
   }
 
-  const double delta = currentTotal - lastPpointsTotalAmount;
+  const bool isNewRecord = count != lastPpointsCount || result.amount != formatMoney(lastPpointsTotalAmount);
   char deltaBuffer[24];
-  std::snprintf(deltaBuffer, sizeof(deltaBuffer), "%+.2f", delta);
+  std::snprintf(deltaBuffer, sizeof(deltaBuffer), "%+.2f", currentTotal - lastPpointsTotalAmount);
   deltaText = deltaBuffer;
 
   lastPpointsTotalAmount = currentTotal;
   lastPpointsCount = count;
 
-  const std::string paymentId = "ppoints-monitor-delta-" + stationId + "-" + bankId + "-" + count + "-" + deltaText;
-  if (delta > 0.0 && paymentId != lastPaymentId) {
-    const std::string deltaAmount = formatMoney(delta);
-    confirmPayment(paymentId, deltaAmount, "PPOINTS-MONITOR-" + count, "ESP32 P-Points 5min Monitor");
+  const std::string paymentId = "ppoints-monitor-record-" + stationId + "-" + bankId + "-" + count + "-" + result.amount;
+  if (isNewRecord && currentTotal > 0.0 && paymentId != lastPaymentId) {
+    confirmPayment(paymentId, result.amount, "PPOINTS-MONITOR-" + count, "ESP32 P-Points 5min Monitor");
     pulseTriggered = true;
   }
   return paymentId;
@@ -1520,6 +1504,9 @@ void connectWifi() {
   }
 
   setupMode = true;
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
   WiFi.mode(WIFI_AP_STA);
   if (!WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD)) {
     Serial.println("Failed to start setup access point.");
@@ -1531,6 +1518,41 @@ void connectWifi() {
   Serial.print("Setup URL: http://");
   Serial.print(WiFi.softAPIP());
   Serial.println("/setup");
+}
+
+unsigned long wifiReconnectNextAt = 0;
+
+void processWifiReconnect() {
+  if (setupMode || wifiSsid.isEmpty()) {
+    return;
+  }
+
+  static bool wasConnected = true;
+  const bool nowConnected = WiFi.status() == WL_CONNECTED;
+
+  if (nowConnected) {
+    if (!wasConnected) {
+      Serial.print("WiFi reconnected. IP: ");
+      Serial.println(WiFi.localIP());
+      MDNS.end();
+      if (MDNS.begin(MDNS_HOSTNAME)) {
+        MDNS.addService("http", "tcp", 80);
+        Serial.println("mDNS ready: http://paymentesp.local");
+      } else {
+        Serial.println("mDNS unavailable; use the IP address shown above.");
+      }
+    }
+    wasConnected = true;
+    return;
+  }
+
+  wasConnected = false;
+  if (static_cast<long>(millis() - wifiReconnectNextAt) < 0) {
+    return;
+  }
+  wifiReconnectNextAt = millis() + WIFI_RECONNECT_INTERVAL_MS;
+  Serial.println("WiFi disconnected; attempting reconnect...");
+  WiFi.reconnect();
 }
 
 void setupDisplay() {
@@ -1680,4 +1702,5 @@ void loop() {
   processSerialSimulator();
   processPpointsMonitor();
   processPaymentPulses();
+  processWifiReconnect();
 }
