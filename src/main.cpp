@@ -30,10 +30,11 @@ constexpr const char* DEFAULT_WEBHOOK_URL = "";
 constexpr const char* DEFAULT_PROMPTPAY_ID = "0812345678";
 constexpr const char* SETUP_AP_SSID = "PaymentESP-Setup";
 constexpr const char* SETUP_AP_PASSWORD = "paymentesp";
-constexpr const char* MDNS_HOSTNAME = "paymentesp";
+constexpr const char* DEFAULT_MDNS_HOSTNAME = "paymentesp";
 constexpr const char* PREFERENCES_NAMESPACE = "promptpay";
 constexpr const char* PREFERENCES_ID_KEY = "id";
 constexpr const char* PREFERENCES_WEBHOOK_KEY = "webhook";
+constexpr const char* PREFERENCES_HOSTNAME_KEY = "hostname";
 constexpr const char* PREFERENCES_WIFI_SSID_KEY = "wifiSsid";
 constexpr const char* PREFERENCES_WIFI_PASSWORD_KEY = "wifiPass";
 constexpr const char* DEFAULT_PPOINTS_STATION_ID = "P-24001";
@@ -50,8 +51,13 @@ constexpr int QR_AREA_Y = 160;
 constexpr int QR_AREA_SIZE = 150;
 constexpr int PAYMENT_PULSE_PIN = 15;
 constexpr int PAYMENT_PULSE_TENS_PIN = 2;
-constexpr unsigned long PAYMENT_PULSE_DURATION_MS = 500;
-constexpr unsigned long PAYMENT_PULSE_GAP_MS = 250;
+constexpr unsigned long DEFAULT_PULSE_WIDTH_MS = 25;
+constexpr unsigned long DEFAULT_PULSE_SPACE_WIDTH_MS = 25;
+constexpr int DEFAULT_PULSE_DIVISOR_ONES = 1;
+constexpr int DEFAULT_PULSE_DIVISOR_TENS = 10;
+constexpr unsigned long MAX_PULSE_WIDTH_MS = 200;
+constexpr int MAX_PULSE_DIVISOR_ONES = 100;
+constexpr int MAX_PULSE_DIVISOR_TENS = 10000;
 constexpr unsigned long PPOINTS_QR_TTL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long PPOINTS_POLL_INTERVAL_MS = 5000;
 constexpr unsigned long WIFI_RECONNECT_INTERVAL_MS = 15000;
@@ -62,6 +68,7 @@ WebServer server(80);
 Preferences preferences;
 PromptPayConfig qrConfig{DEFAULT_PROMPTPAY_ID, "PROMPTPAY", "BANGKOK"};
 std::string webhookUrl = DEFAULT_WEBHOOK_URL;
+std::string mdnsHostname = DEFAULT_MDNS_HOSTNAME;
 std::deque<QrEvent> logs;
 String wifiSsid = DEFAULT_WIFI_SSID;
 String wifiPassword = DEFAULT_WIFI_PASSWORD;
@@ -88,8 +95,15 @@ std::string lastPpointsCount;
 bool ppointsSessionActive = false;
 unsigned long ppointsSessionExpiresAt = 0;
 bool twoPinPulseMode = false;
+unsigned long pulseWidthMs = DEFAULT_PULSE_WIDTH_MS;
+unsigned long pulseSpaceWidthMs = DEFAULT_PULSE_SPACE_WIDTH_MS;
+int pulseDivisorOnes = DEFAULT_PULSE_DIVISOR_ONES;
+int pulseDivisorTens = DEFAULT_PULSE_DIVISOR_TENS;
 bool ppointsMonitorEnabled = true;
+bool ppointsMonitorContinuous = true;
 unsigned long ppointsMonitorIntervalMs = PPOINTS_MONITOR_INTERVAL_MS;
+unsigned long ppointsMonitorTimeoutMs = PPOINTS_QR_TTL_MS;
+unsigned long ppointsMonitorStartedAt = 0;
 unsigned long ppointsMonitorNextAt = 0;
 unsigned long ppointsMonitorChecks = 0;
 std::string ppointsMonitorStationId = DEFAULT_PPOINTS_STATION_ID;
@@ -243,6 +257,25 @@ bool validateWebhookUrl(const std::string& url, std::string& error) {
   return true;
 }
 
+bool validateHostname(const std::string& hostname, std::string& error) {
+  if (hostname.empty() || hostname.size() > 32) {
+    error = "hostname must be 1-32 characters";
+    return false;
+  }
+  for (char ch : hostname) {
+    const bool isAlnum = std::isalnum(static_cast<unsigned char>(ch)) != 0;
+    if (!isAlnum && ch != '-') {
+      error = "hostname may only contain letters, numbers, and hyphens";
+      return false;
+    }
+  }
+  if (hostname.front() == '-' || hostname.back() == '-') {
+    error = "hostname must not start or end with a hyphen";
+    return false;
+  }
+  return true;
+}
+
 bool applyWebhookFromRequest(std::string& error, bool persist = false) {
   if (!server.hasArg("webhook")) {
     return true;
@@ -287,6 +320,16 @@ void loadPersistedConfig() {
     Serial.print("Saved webhook URL is invalid, using default: ");
     Serial.println(error.c_str());
     webhookUrl = DEFAULT_WEBHOOK_URL;
+  }
+
+  const String savedHostname = preferences.getString(PREFERENCES_HOSTNAME_KEY, DEFAULT_MDNS_HOSTNAME);
+  error.clear();
+  if (validateHostname(savedHostname.c_str(), error)) {
+    mdnsHostname = savedHostname.c_str();
+  } else {
+    Serial.print("Saved hostname is invalid, using default: ");
+    Serial.println(error.c_str());
+    mdnsHostname = DEFAULT_MDNS_HOSTNAME;
   }
 }
 
@@ -493,15 +536,6 @@ double extractAmountFromText(const String& text) {
   return candidate.toDouble();
 }
 
-int pulseCountFromAmount(const std::string& amount) {
-  const double value = String(amount.c_str()).toDouble();
-  if (value <= 0.0) {
-    return 0;
-  }
-  const int pulses = static_cast<int>(value);
-  return std::min(std::max(pulses, 1), MAX_PAYMENT_PULSES);
-}
-
 int wholeBahtFromAmount(const std::string& amount) {
   const double value = String(amount.c_str()).toDouble();
   if (value <= 0.0) {
@@ -526,14 +560,18 @@ void startPaymentPulsesForAmount(const std::string& amount) {
   paymentPulsesOnes = 0;
   paymentPulsesTens = 0;
 
+  const int wholeBaht = wholeBahtFromAmount(amount);
   if (twoPinPulseMode) {
-    const int wholeBaht = wholeBahtFromAmount(amount);
-    paymentPulsesTens = wholeBaht / 10;
-    paymentPulsesOnes = wholeBaht % 10;
+    int remainder = wholeBaht;
+    if (pulseDivisorTens > 0) {
+      paymentPulsesTens = remainder / pulseDivisorTens;
+      remainder -= paymentPulsesTens * pulseDivisorTens;
+    }
+    paymentPulsesOnes = pulseDivisorOnes > 0 ? remainder / pulseDivisorOnes : 0;
     enqueuePulsePin(PAYMENT_PULSE_TENS_PIN, paymentPulsesTens);
     enqueuePulsePin(PAYMENT_PULSE_PIN, paymentPulsesOnes);
   } else {
-    paymentPulsesOnes = pulseCountFromAmount(amount);
+    paymentPulsesOnes = pulseDivisorOnes > 0 ? wholeBaht / pulseDivisorOnes : 0;
     enqueuePulsePin(PAYMENT_PULSE_PIN, paymentPulsesOnes);
   }
 
@@ -580,7 +618,7 @@ void processPaymentPulses() {
       return;
     }
 
-    paymentPulseNextAt = millis() + PAYMENT_PULSE_GAP_MS;
+    paymentPulseNextAt = millis() + pulseSpaceWidthMs;
     return;
   }
 
@@ -589,7 +627,7 @@ void processPaymentPulses() {
   digitalWrite(paymentPulseCurrentPin, HIGH);
   paymentPulseHigh = true;
   --paymentPulsesPending;
-  paymentPulseNextAt = millis() + PAYMENT_PULSE_DURATION_MS;
+  paymentPulseNextAt = millis() + pulseWidthMs;
 }
 
 bool confirmPayment(const std::string& paymentId,
@@ -850,17 +888,17 @@ void handleSetup() {
   if (server.method() == HTTP_POST) {
     const String requestedSsid = server.arg("ssid");
     const String requestedPassword = server.arg("password");
-    const std::string requestedPromptPay = server.arg("promptpay").c_str();
     const std::string requestedWebhook = server.arg("webhook").c_str();
+    const std::string requestedHostname = server.arg("hostname").c_str();
     std::string error;
 
     if (requestedSsid.isEmpty() || requestedSsid.length() > 32) {
       error = "WiFi SSID is required and must not exceed 32 characters";
     } else if (requestedPassword.length() > 63) {
       error = "WiFi password must not exceed 63 characters";
-    } else if (!validatePromptPayId(requestedPromptPay, error)) {
-      // Validation error is already populated.
     } else if (!validateWebhookUrl(requestedWebhook, error)) {
+      // Validation error is already populated.
+    } else if (!validateHostname(requestedHostname, error)) {
       // Validation error is already populated.
     }
 
@@ -872,18 +910,20 @@ void handleSetup() {
         wifiPassword = requestedPassword;
       }
       wifiSsid = requestedSsid;
-      qrConfig.promptPayId = requestedPromptPay;
       webhookUrl = requestedWebhook;
+      mdnsHostname = requestedHostname;
       preferences.putString(PREFERENCES_WIFI_SSID_KEY, wifiSsid);
       preferences.putString(PREFERENCES_WIFI_PASSWORD_KEY, wifiPassword);
-      preferences.putString(PREFERENCES_ID_KEY, qrConfig.promptPayId.c_str());
       preferences.putString(PREFERENCES_WEBHOOK_KEY, webhookUrl.c_str());
+      preferences.putString(PREFERENCES_HOSTNAME_KEY, mdnsHostname.c_str());
 
-      server.send(200, "text/html; charset=utf-8",
-                  "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                  "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:40px auto;padding:20px}</style>"
-                  "<h1>Settings saved</h1><p>ESP32 is restarting and will connect to the configured WiFi.</p>"
-                  "<p>Reconnect your phone or computer to the same WiFi, then open <b>http://paymentesp.local</b>.</p>");
+      const std::string savedPage =
+          "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'>"
+          "<style>body{font-family:Arial,sans-serif;max-width:600px;margin:40px auto;padding:20px}</style>"
+          "<h1>Settings saved</h1><p>ESP32 is restarting and will connect to the configured WiFi.</p>"
+          "<p>Reconnect your phone or computer to the same WiFi, then open <b>http://" +
+          mdnsHostname + ".local</b>.</p>";
+      server.send(200, "text/html; charset=utf-8", savedPage.c_str());
       delay(900);
       ESP.restart();
       return;
@@ -891,8 +931,8 @@ void handleSetup() {
   }
 
   const std::string currentSsid = htmlEscape(wifiSsid.c_str());
-  const std::string currentPromptPay = htmlEscape(qrConfig.promptPayId);
   const std::string currentWebhook = htmlEscape(webhookUrl);
+  const std::string currentHostname = htmlEscape(mdnsHostname);
   std::string html =
       "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<title>PaymentESP Setup</title><style>body{font-family:Arial,sans-serif;max-width:620px;margin:24px auto;padding:0 16px;line-height:1.45;background:#f5f7f8;color:#17202a}"
@@ -903,7 +943,8 @@ void handleSetup() {
   html += "<div class='panel'><form method='post' action='/setup'>"
           "<label>WiFi SSID</label><input name='ssid' maxlength='32' required value='" + currentSsid + "'>"
           "<label>WiFi Password</label><input name='password' type='password' maxlength='63' placeholder='Leave blank to keep the current password'>"
-          "<label>PromptPay ID</label><input name='promptpay' inputmode='numeric' required value='" + currentPromptPay + "'>"
+          "<label>Device Hostname</label><input name='hostname' maxlength='32' required value='" + currentHostname + "' placeholder='paymentesp'>"
+          "<p class='note' style='margin-top:2px'>Access URL will be: http://" + currentHostname + ".local</p>"
           "<label>REST POST Webhook URL</label><input name='webhook' value='" + currentWebhook + "' placeholder='Optional: http://192.168.1.10:3001/api/webhook'>"
           "<button type='submit'>Save and restart ESP32</button></form></div>"
           "<p class='note'>Setup AP: PaymentESP-Setup | Password: paymentesp | Setup URL: http://192.168.4.1/setup</p>"
@@ -940,8 +981,15 @@ void handleRoot() {
       "<label>stn_id</label><input id='ppStn' value='P-24001'>"
       "<label>bank_id</label><input id='ppBank' value='X-9786'>"
       "<label>Pulse Mode</label><select id='pulseMode'><option value='1pin'>1 pin: 1 baht / pulse</option><option value='2pin'>2 pins: A=ones, B=10 baht/pulse</option></select>"
+      "<div class='row'><div><label>O/P#1 divisor (baht/pulse, 0-100)</label><input id='pulseDivisor1' type='number' min='0' max='100' value='1'></div>"
+      "<div><label>O/P#2 divisor (baht/pulse, 0-10000)</label><input id='pulseDivisor2' type='number' min='0' max='10000' value='10'></div></div>"
+      "<div class='row'><div><label>PulseWidth (ms, 1-200)</label><input id='pulseWidth' type='number' min='1' max='200' value='25'></div>"
+      "<div><label>PulseSpaceWidth (ms, 1-200)</label><input id='pulseGap' type='number' min='1' max='200' value='25'></div></div>"
       "<button id='ppCheck' type='button'>Check P-Points Pay-in</button>"
-      "<div class='row'><button id='monitorStart' type='button'>Restart 5-sec Monitor</button>"
+      "<label>Polling Mode</label><select id='pollingMode'><option value='continuous'>1A: Poll continuously</option><option value='session'>1B: Poll until Start, stop on Timeout</option></select>"
+      "<div class='row'><div><label>Polling Period (sec)</label><input id='pollingPeriod' type='number' min='5' value='5'></div>"
+      "<div><label>Timeout (sec, mode 1B only)</label><input id='pollingTimeout' type='number' min='1' value='300'></div></div>"
+      "<div class='row'><button id='monitorStart' type='button'>Start Monitor</button>"
       "<button id='monitorStop' type='button' class='secondary'>Stop Monitor</button></div>"
       "<p id='monitorStatus'>Monitor auto starting...</p>"
       "<p class='note'>Monitor checks P-Points by stn_id + bank_id every 5 seconds and sends pulse only when a new pay-in amount is detected.</p></div>"
@@ -957,9 +1005,9 @@ void handleRoot() {
       "async function generatePpointsQr(mode){latestQrMode=mode;setPpActive(mode);placeholderQr('P-Points '+mode.toUpperCase());let p=new URLSearchParams({mode:mode,payload:document.getElementById('ppPayload').value});if(mode==='dynamic')p.set('amount',document.getElementById('ppAmount').value||'1.00');let r=await fetch('/api/ppoints/qr?'+p);let j=await r.json();show(j);if(j.payload){setQrImage(j.payload,'P-Points '+mode.toUpperCase()+(mode==='dynamic'?' THB '+(j.amount||document.getElementById('ppAmount').value):' no amount'))}return j}"
       "async function showCustomerQr(){if(!latestPayload)await generatePpointsQr('dynamic');let p=new URLSearchParams({stn_id:latestQrMode.toUpperCase(),bank_id:'GENQR',ref:'PPOINTS-'+latestQrMode.toUpperCase(),payload:latestPayload});let r=await fetch('/api/customer-qr?'+p);return await r.json()}"
       "async function setPpointsBaseline(){let p=new URLSearchParams({stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value});let r=await fetch('/api/ppoints/baseline?'+p);return await r.json()}"
-      "async function savePulseMode(){let p=new URLSearchParams({mode:document.getElementById('pulseMode').value});let r=await fetch('/api/pulse/config?'+p);return await r.json()}"
-      "function showMonitorStatus(j){document.getElementById('monitorStatus').textContent='Monitor '+(j.enabled?'ON':'OFF')+' | '+(j.intervalMs/1000)+'s | next '+Math.ceil((j.nextInMs||0)/1000)+'s | checks '+j.checks+' | pulse '+j.pulseMode+' | last '+(j.lastTotal||'-')+(j.lastError?' | error '+j.lastError:'')}"
-      "async function monitor(action){let p=new URLSearchParams({action:action,stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value,interval_ms:'5000'});let pulse=await savePulseMode();let r=await fetch('/api/ppoints/monitor?'+p);let j=await r.json();showMonitorStatus(j);show({pulse:pulse,monitor:j});return j}"
+      "async function savePulseMode(){let p=new URLSearchParams({mode:document.getElementById('pulseMode').value,divisor1:document.getElementById('pulseDivisor1').value,divisor2:document.getElementById('pulseDivisor2').value,width:document.getElementById('pulseWidth').value,gap:document.getElementById('pulseGap').value});let r=await fetch('/api/pulse/config?'+p);return await r.json()}"
+      "function showMonitorStatus(j){document.getElementById('monitorStatus').textContent='Monitor '+(j.enabled?'ON':'OFF')+' | '+j.pollingMode+' | '+(j.intervalMs/1000)+'s | next '+Math.ceil((j.nextInMs||0)/1000)+'s'+(j.pollingMode==='session'?' | timeout in '+Math.ceil((j.timeoutRemainingMs||0)/1000)+'s':'')+' | checks '+j.checks+' | pulse '+j.pulseMode+' O/P#1='+j.divisor1+' O/P#2='+j.divisor2+' width='+j.pulseWidthMs+'ms gap='+j.pulseSpaceWidthMs+'ms | last '+(j.lastTotal||'-')+(j.lastError?' | error '+j.lastError:'')}"
+      "async function monitor(action){let p=new URLSearchParams({action:action,stn_id:document.getElementById('ppStn').value,bank_id:document.getElementById('ppBank').value,interval_ms:String((Number(document.getElementById('pollingPeriod').value)||5)*1000),polling_mode:document.getElementById('pollingMode').value,timeout_ms:String((Number(document.getElementById('pollingTimeout').value)||300)*1000)});let pulse=await savePulseMode();let r=await fetch('/api/ppoints/monitor?'+p);let j=await r.json();showMonitorStatus(j);show({pulse:pulse,monitor:j});return j}"
       "async function refreshMonitor(){let r=await fetch('/api/ppoints/monitor?action=status');let j=await r.json();showMonitorStatus(j);return j}"
       "async function applyQrChanges(){let qr=await generatePpointsQr(latestQrMode==='static'?'static':'dynamic');let oled=await showCustomerQr();show({qr:qr,oled:oled,note:'P-Points QR updated after pressing Apply QR Changes.'})}"
       "let ppFieldTimer=0;function schedulePpointsApply(kind){clearTimeout(ppFieldTimer);ppFieldTimer=setTimeout(async()=>{try{if(kind==='pulse'){show({pulse:await savePulseMode(),note:'Pulse mode updated immediately.'});return}if(kind==='monitor'){let j=await monitor('start');show({monitor:j,note:'P-Points station/bank updated. Baseline reset.'});return}setQrStatus('QR settings changed. Press Apply QR Changes.');show({pending:true,note:'Amount/Payload changed. Press Apply QR Changes to regenerate QR.'})}catch(e){show({error:e.message})}},500)}"
@@ -981,7 +1029,14 @@ void handleRoot() {
       "document.getElementById('ppPayload').oninput=()=>schedulePpointsApply('qr');"
       "document.getElementById('ppStn').oninput=()=>schedulePpointsApply('monitor');"
       "document.getElementById('ppBank').oninput=()=>schedulePpointsApply('monitor');"
+      "document.getElementById('pollingMode').onchange=()=>schedulePpointsApply('monitor');"
+      "document.getElementById('pollingPeriod').onchange=()=>schedulePpointsApply('monitor');"
+      "document.getElementById('pollingTimeout').onchange=()=>schedulePpointsApply('monitor');"
       "document.getElementById('pulseMode').onchange=()=>schedulePpointsApply('pulse');"
+      "document.getElementById('pulseDivisor1').onchange=()=>schedulePpointsApply('pulse');"
+      "document.getElementById('pulseDivisor2').onchange=()=>schedulePpointsApply('pulse');"
+      "document.getElementById('pulseWidth').onchange=()=>schedulePpointsApply('pulse');"
+      "document.getElementById('pulseGap').onchange=()=>schedulePpointsApply('pulse');"
       "loadConfig().then(()=>{setQrStatus('Choose P-Points Static or Dynamic QR');refreshMonitor();setInterval(()=>refreshMonitor().catch(()=>{}),5000)});</script>"
       "</body></html>";
   server.send(200, "text/html", html);
@@ -1090,7 +1145,7 @@ void handleConfig() {
   body += "\"setupMode\":" + std::string(setupMode ? "true" : "false") + ",";
   body += "\"ssid\":\"" + jsonEscape(wifiSsid.c_str()) + "\",";
   body += "\"ip\":\"" + std::string((setupMode ? WiFi.softAPIP() : WiFi.localIP()).toString().c_str()) + "\",";
-  body += "\"hostname\":\"http://" + std::string(MDNS_HOSTNAME) + ".local\"";
+  body += "\"hostname\":\"http://" + mdnsHostname + ".local\"";
   body += "}";
   sendJson(body);
 }
@@ -1298,8 +1353,8 @@ void handlePpointsMock() {
 }
 
 void handlePpointsCheck() {
-  const std::string stationId = argOrDefault("stn_id", DEFAULT_PPOINTS_STATION_ID).c_str();
-  const std::string bankId = argOrDefault("bank_id", DEFAULT_PPOINTS_BANK_ID).c_str();
+  const std::string stationId = argOrDefault("stn_id", String(ppointsMonitorStationId.c_str())).c_str();
+  const std::string bankId = argOrDefault("bank_id", String(ppointsMonitorBankId.c_str())).c_str();
 
   PpointsResult parsed;
   int status = 0;
@@ -1361,9 +1416,17 @@ std::string ppointsMonitorStatusJson() {
   const unsigned long nextInMs =
       ppointsMonitorEnabled && static_cast<long>(ppointsMonitorNextAt - millis()) > 0 ? ppointsMonitorNextAt - millis()
                                                                                        : 0;
+  const unsigned long timeoutAt = ppointsMonitorStartedAt + ppointsMonitorTimeoutMs;
+  const unsigned long timeoutRemainingMs = (!ppointsMonitorContinuous && ppointsMonitorEnabled &&
+                                             static_cast<long>(timeoutAt - millis()) > 0)
+                                                ? (timeoutAt - millis())
+                                                : 0;
   std::string body = "{";
   body += "\"ok\":true,";
   body += "\"enabled\":" + std::string(ppointsMonitorEnabled ? "true" : "false") + ",";
+  body += "\"pollingMode\":\"" + std::string(ppointsMonitorContinuous ? "continuous" : "session") + "\",";
+  body += "\"timeoutMs\":" + std::to_string(ppointsMonitorTimeoutMs) + ",";
+  body += "\"timeoutRemainingMs\":" + std::to_string(timeoutRemainingMs) + ",";
   body += "\"stationId\":\"" + jsonEscape(ppointsMonitorStationId) + "\",";
   body += "\"bankId\":\"" + jsonEscape(ppointsMonitorBankId) + "\",";
   body += "\"intervalMs\":" + std::to_string(ppointsMonitorIntervalMs) + ",";
@@ -1374,7 +1437,11 @@ std::string ppointsMonitorStatusJson() {
   body += "\"lastError\":\"" + jsonEscape(ppointsMonitorLastError) + "\",";
   body += "\"pulseMode\":\"" + std::string(twoPinPulseMode ? "two-pin" : "one-pin") + "\",";
   body += "\"pulseOnesPin\":" + std::to_string(PAYMENT_PULSE_PIN) + ",";
-  body += "\"pulseTensPin\":" + std::to_string(PAYMENT_PULSE_TENS_PIN);
+  body += "\"pulseTensPin\":" + std::to_string(PAYMENT_PULSE_TENS_PIN) + ",";
+  body += "\"divisor1\":" + std::to_string(pulseDivisorOnes) + ",";
+  body += "\"divisor2\":" + std::to_string(pulseDivisorTens) + ",";
+  body += "\"pulseWidthMs\":" + std::to_string(pulseWidthMs) + ",";
+  body += "\"pulseSpaceWidthMs\":" + std::to_string(pulseSpaceWidthMs);
   body += "}";
   return body;
 }
@@ -1392,11 +1459,51 @@ void handlePulseConfig() {
     }
   }
 
+  if (server.hasArg("divisor1")) {
+    const int requested = server.arg("divisor1").toInt();
+    if (requested < 0 || requested > MAX_PULSE_DIVISOR_ONES) {
+      sendJson("{\"error\":\"divisor1 must be 0-" + std::to_string(MAX_PULSE_DIVISOR_ONES) + "\"}", 400);
+      return;
+    }
+    pulseDivisorOnes = requested;
+  }
+
+  if (server.hasArg("divisor2")) {
+    const int requested = server.arg("divisor2").toInt();
+    if (requested < 0 || requested > MAX_PULSE_DIVISOR_TENS) {
+      sendJson("{\"error\":\"divisor2 must be 0-" + std::to_string(MAX_PULSE_DIVISOR_TENS) + "\"}", 400);
+      return;
+    }
+    pulseDivisorTens = requested;
+  }
+
+  if (server.hasArg("width")) {
+    const long requested = server.arg("width").toInt();
+    if (requested < 1 || requested > static_cast<long>(MAX_PULSE_WIDTH_MS)) {
+      sendJson("{\"error\":\"width must be 1-" + std::to_string(MAX_PULSE_WIDTH_MS) + "\"}", 400);
+      return;
+    }
+    pulseWidthMs = static_cast<unsigned long>(requested);
+  }
+
+  if (server.hasArg("gap")) {
+    const long requested = server.arg("gap").toInt();
+    if (requested < 1 || requested > static_cast<long>(MAX_PULSE_WIDTH_MS)) {
+      sendJson("{\"error\":\"gap must be 1-" + std::to_string(MAX_PULSE_WIDTH_MS) + "\"}", 400);
+      return;
+    }
+    pulseSpaceWidthMs = static_cast<unsigned long>(requested);
+  }
+
   std::string body = "{";
   body += "\"ok\":true,";
   body += "\"pulseMode\":\"" + std::string(twoPinPulseMode ? "two-pin" : "one-pin") + "\",";
   body += "\"pulseOnesPin\":" + std::to_string(PAYMENT_PULSE_PIN) + ",";
-  body += "\"pulseTensPin\":" + std::to_string(PAYMENT_PULSE_TENS_PIN);
+  body += "\"pulseTensPin\":" + std::to_string(PAYMENT_PULSE_TENS_PIN) + ",";
+  body += "\"divisor1\":" + std::to_string(pulseDivisorOnes) + ",";
+  body += "\"divisor2\":" + std::to_string(pulseDivisorTens) + ",";
+  body += "\"pulseWidthMs\":" + std::to_string(pulseWidthMs) + ",";
+  body += "\"pulseSpaceWidthMs\":" + std::to_string(pulseSpaceWidthMs);
   body += "}";
   sendJson(body);
 }
@@ -1408,7 +1515,15 @@ void handlePpointsMonitor() {
     ppointsMonitorBankId = argOrDefault("bank_id", DEFAULT_PPOINTS_BANK_ID).c_str();
     const long requestedIntervalMs = argOrDefault("interval_ms", String(PPOINTS_MONITOR_INTERVAL_MS)).toInt();
     ppointsMonitorIntervalMs = static_cast<unsigned long>(std::max(5000L, requestedIntervalMs));
+
+    const std::string pollingMode = argOrDefault("polling_mode", "continuous").c_str();
+    ppointsMonitorContinuous = pollingMode != "session" && pollingMode != "1b";
+
+    const long requestedTimeoutMs = argOrDefault("timeout_ms", String(PPOINTS_QR_TTL_MS)).toInt();
+    ppointsMonitorTimeoutMs = static_cast<unsigned long>(std::max(1000L, requestedTimeoutMs));
+
     ppointsMonitorEnabled = true;
+    ppointsMonitorStartedAt = millis();
     ppointsMonitorNextAt = millis();
     ppointsMonitorChecks = 0;
     ppointsMonitorLastError.clear();
@@ -1430,7 +1545,18 @@ void handlePpointsMonitor() {
 }
 
 void processPpointsMonitor() {
-  if (!ppointsMonitorEnabled || static_cast<long>(millis() - ppointsMonitorNextAt) < 0) {
+  if (!ppointsMonitorEnabled) {
+    return;
+  }
+
+  if (!ppointsMonitorContinuous &&
+      static_cast<long>(millis() - (ppointsMonitorStartedAt + ppointsMonitorTimeoutMs)) >= 0) {
+    ppointsMonitorEnabled = false;
+    Serial.println("P-Points monitor stopped: polling timeout reached.");
+    return;
+  }
+
+  if (static_cast<long>(millis() - ppointsMonitorNextAt) < 0) {
     return;
   }
 
@@ -1479,7 +1605,7 @@ void connectWifi() {
   setupMode = false;
   if (!wifiSsid.isEmpty()) {
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname(MDNS_HOSTNAME);
+    WiFi.setHostname(mdnsHostname.c_str());
     Serial.print("Connecting to WiFi: ");
     Serial.println(wifiSsid);
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
@@ -1494,9 +1620,9 @@ void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("WiFi connected. IP: ");
     Serial.println(WiFi.localIP());
-    if (MDNS.begin(MDNS_HOSTNAME)) {
+    if (MDNS.begin(mdnsHostname.c_str())) {
       MDNS.addService("http", "tcp", 80);
-      Serial.println("mDNS ready: http://paymentesp.local");
+      Serial.println(("mDNS ready: http://" + mdnsHostname + ".local").c_str());
     } else {
       Serial.println("mDNS unavailable; use the IP address shown above.");
     }
@@ -1535,9 +1661,9 @@ void processWifiReconnect() {
       Serial.print("WiFi reconnected. IP: ");
       Serial.println(WiFi.localIP());
       MDNS.end();
-      if (MDNS.begin(MDNS_HOSTNAME)) {
+      if (MDNS.begin(mdnsHostname.c_str())) {
         MDNS.addService("http", "tcp", 80);
-        Serial.println("mDNS ready: http://paymentesp.local");
+        Serial.println(("mDNS ready: http://" + mdnsHostname + ".local").c_str());
       } else {
         Serial.println("mDNS unavailable; use the IP address shown above.");
       }
@@ -1574,7 +1700,7 @@ void renderNetworkStatus() {
   } else {
     sendToDisplay("t0", "PaymentESP READY");
     sendToDisplay("t1", std::string(WiFi.localIP().toString().c_str()));
-    sendToDisplay("t2", "paymentesp.local");
+    sendToDisplay("t2", mdnsHostname + ".local");
     sendToDisplay("t3", "Open browser");
   }
   clearQrArea();
@@ -1690,6 +1816,8 @@ void setup() {
   server.on("/api/pulse/config", HTTP_GET, handlePulseConfig);
   server.on("/api/payment", HTTP_GET, handlePaymentConfirmation);
   server.on("/api/payment", HTTP_POST, handlePaymentConfirmation);
+  server.on("/api/payment/trigger", HTTP_GET, handlePpointsCheck);
+  server.on("/api/payment/trigger", HTTP_POST, handlePpointsCheck);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("HTTP server started on port 80");
