@@ -1,5 +1,6 @@
 #include <HTTPClient.h>
 #include <ESPmDNS.h>
+#include <NetBIOS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -61,6 +62,7 @@ constexpr int MAX_PULSE_DIVISOR_TENS = 10000;
 constexpr unsigned long PPOINTS_QR_TTL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long PPOINTS_POLL_INTERVAL_MS = 5000;
 constexpr unsigned long WIFI_RECONNECT_INTERVAL_MS = 15000;
+constexpr unsigned long MDNS_REFRESH_INTERVAL_MS = 5UL * 60UL * 1000UL;
 constexpr unsigned long PPOINTS_MONITOR_INTERVAL_MS = 5000;
 constexpr int MAX_PAYMENT_PULSES = 200;
 
@@ -1253,7 +1255,13 @@ bool fetchPpointsResult(const std::string& stationId,
   std::string url = std::string(PPOINTS_BASE_URL) + "?stn_id=" + stationId + "&bank_id=" + bankId + "&flg=W";
   WiFiClientSecure client;
   client.setInsecure();
+  // WiFiClientSecure defaults to a 120s TLS handshake timeout; left unset, a single
+  // stalled handshake to p-points.com freezes the whole loop() (web server, WiFi
+  // reconnect, everything) for up to 2 minutes at a time. Bound it to match the
+  // HTTPClient timeout below so a bad network blip can't lock up the board.
+  client.setHandshakeTimeout(8);
   HTTPClient http;
+  http.setConnectTimeout(8000);
   http.setTimeout(8000);
   if (!http.begin(client, url.c_str())) {
     error = "failed to start P-Points request";
@@ -1601,6 +1609,8 @@ void handleNotFound() {
   sendJson("{\"error\":\"not found\"}", 404);
 }
 
+unsigned long mdnsRefreshNextAt = 0;
+
 void connectWifi() {
   setupMode = false;
   if (!wifiSsid.isEmpty()) {
@@ -1609,6 +1619,7 @@ void connectWifi() {
     Serial.print("Connecting to WiFi: ");
     Serial.println(wifiSsid);
     WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+    WiFi.setSleep(false);
     const unsigned long deadline = millis() + 20000;
     while (WiFi.status() != WL_CONNECTED && static_cast<long>(millis() - deadline) < 0) {
       delay(250);
@@ -1626,6 +1637,10 @@ void connectWifi() {
     } else {
       Serial.println("mDNS unavailable; use the IP address shown above.");
     }
+    // Windows doesn't resolve .local (mDNS) names without Bonjour installed, but it
+    // does resolve NetBIOS names natively, so also answer to the plain hostname.
+    NBNS.begin(mdnsHostname.c_str());
+    mdnsRefreshNextAt = millis() + MDNS_REFRESH_INTERVAL_MS;
     return;
   }
 
@@ -1667,6 +1682,8 @@ void processWifiReconnect() {
       } else {
         Serial.println("mDNS unavailable; use the IP address shown above.");
       }
+      NBNS.begin(mdnsHostname.c_str());
+      mdnsRefreshNextAt = millis() + MDNS_REFRESH_INTERVAL_MS;
     }
     wasConnected = true;
     return;
@@ -1679,6 +1696,26 @@ void processWifiReconnect() {
   wifiReconnectNextAt = millis() + WIFI_RECONNECT_INTERVAL_MS;
   Serial.println("WiFi disconnected; attempting reconnect...");
   WiFi.reconnect();
+}
+
+// ESP32 Arduino's mDNS responder is known to silently stop answering
+// paymentesp.local queries after running for a while even though WiFi
+// itself stays connected; periodically restarting it works around that.
+void processMdnsRefresh() {
+  if (setupMode || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  if (static_cast<long>(millis() - mdnsRefreshNextAt) < 0) {
+    return;
+  }
+  mdnsRefreshNextAt = millis() + MDNS_REFRESH_INTERVAL_MS;
+  MDNS.end();
+  if (MDNS.begin(mdnsHostname.c_str())) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println(("mDNS refreshed: http://" + mdnsHostname + ".local").c_str());
+  } else {
+    Serial.println("mDNS refresh failed; use the IP address instead.");
+  }
 }
 
 void setupDisplay() {
@@ -1831,4 +1868,5 @@ void loop() {
   processPpointsMonitor();
   processPaymentPulses();
   processWifiReconnect();
+  processMdnsRefresh();
 }
